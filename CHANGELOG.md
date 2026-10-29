@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.1
+
+- **Slow USB ports work, with a warning.** On some USB controllers (AMD 500-series chipset ports) every
+  register access takes ~10-25 ms instead of ~1-2 ms, and the camera firmware's own per-frame I2C job wiped the driver's half-written
+  sensor writes: no exposure longer than 33 ms could be set ("camera did not take the exposure"). The driver now
+  times register access at connect and, on a slow port, streams at 15 fps, sets the first timing during a
+  retried STANDBY, and keeps the frame period at least 0.25 s (`SlowPortReadMs`, `SlowPortMinPeriodMs`).
+  The image can look grainier in this mode (under investigation), so it is not recommended for guiding: the
+  camera description shows *"slow USB port"*, the log a warning, and the README recommends a port on the CPU's
+  USB controller. (0.6.0 was a local test build only.)
+- New setting `FrameIntervalMs` (UVC frame interval at connect; at 15 fps the sensor line time doubles, which
+  the driver takes into account).
+- SxTest: new test commands `sbwrite`, `sbstat`, `asicw`, `xuwatch`, `uvcfps` and options `--xudelay`,
+  `--short`, `exp --pause`; `formats` shows the frame interval range.
+- The README in the package no longer mentions the removed issue template.
+- Known issue: on a fast port the first timing write after plugging in occasionally does not take or is followed
+  by 8-byte frames that a stream restart does not always clear; reconnecting helps.
+
 ## 0.5.0 – first public test release
 
 - Chooser name is now **Sonix IMX290** (was "Sonix IMX290 (UVC, long exposure)"). ProgID

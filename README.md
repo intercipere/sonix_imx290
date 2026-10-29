@@ -67,6 +67,16 @@ The first exposure after connecting, and the first one after changing the exposu
 (the driver writes the new timing and checks that the camera took it, up to a few seconds). After that each
 frame takes about the exposure time.
 
+> **Warning: USB port matters.** On some USB controllers (seen on the chipset ports of an AMD 500-series
+> board) the camera's register access is about ten times slower, and timing writes fail at the camera's normal
+> 30 fps. The driver detects this at connect and switches to a *slow USB port mode*: it streams at 15 fps, gets
+> the first timing through a retried STANDBY (the first exposure takes a few seconds longer), and keeps every
+> frame at least 0.25 s long (shorter exposures are still exact, but come at most 4 per second). Exposures work,
+> but **the image can look noticeably grainier** in this mode (under investigation, see the issues), so it is
+> **not recommended for guiding**. Use a port on the CPU's USB controller instead (on desktop PCs usually a rear
+> port). You can tell the mode from the camera description (*"slow USB port"*) or the log line `slow USB port
+> mode`.
+
 ### Settings
 
 The chooser's *Properties* button opens the settings (stored in `HKCU\Software\Sonix290Camera`). The defaults

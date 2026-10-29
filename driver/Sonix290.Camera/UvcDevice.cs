@@ -33,6 +33,18 @@ namespace Sonix290
 
         public long Count { get { lock (gate) return count; } }
         public long LastTicks { get { lock (gate) return lastTicks; } }
+        /// <summary>Host interval of the last frame in seconds (0 if unknown).</summary>
+        public double LastHostDt
+        {
+            get
+            {
+                lock (gate)
+                {
+                    var f = count > 0 ? ring[(count - 1) % Depth] : null;
+                    return f != null && f.HasPrev ? f.HostDt : 0;
+                }
+            }
+        }
 
         /// <summary>Forget the previous frame, so the next one has no interval (after a stream restart).</summary>
         public void BreakChain()
@@ -154,7 +166,7 @@ namespace Sonix290
             return r;
         }
 
-        public static UvcDevice Open(string match, int width, int height, Guid subType, ISampleGrabberCB sink)
+        public static UvcDevice Open(string match, int width, int height, Guid subType, double intervalMs, ISampleGrabberCB sink)
         {
             IMoniker found = null;
             var d = new UvcDevice();
@@ -169,13 +181,13 @@ namespace Sonix290
             if (found == null)
                 throw new InvalidOperationException("No video device whose path contains '" + match + "'. Devices: " +
                                                     string.Join("; ", List()));
-            try { d.Build(found, width, height, subType, sink); }
+            try { d.Build(found, width, height, subType, intervalMs, sink); }
             catch { d.Dispose(); throw; }
             finally { Ole.Release(found); }
             return d;
         }
 
-        void Build(IMoniker moniker, int width, int height, Guid subType, ISampleGrabberCB sink)
+        void Build(IMoniker moniker, int width, int height, Guid subType, double intervalMs, ISampleGrabberCB sink)
         {
             Ole.CreateBindCtx(0, out var ctx);
             var iid = typeof(IBaseFilter).GUID;
@@ -195,6 +207,8 @@ namespace Sonix290
             IPin grabIn = null, grabOut = null, nullIn = null;
             try
             {
+                if (intervalMs > 0)   // VIDEOINFOHEADER(2).AvgTimePerFrame, 100 ns units
+                    Marshal.WriteInt64(Marshal.PtrToStructure<AMMediaType>(pmt).Format, 40, (long)Math.Round(intervalMs * 1e4));
                 Check(((IAMStreamConfig)pin).SetFormat(pmt), "SetFormat");
                 ReadFormat(pmt);
 
@@ -298,8 +312,10 @@ namespace Sonix290
                     for (int i = 0; i < n; i++)
                         if (sc.GetStreamCaps(i, out IntPtr pmt, caps) == 0)
                         {
+                            // VIDEO_STREAM_CONFIG_CAPS.MinFrameInterval / MaxFrameInterval (100 ns) at offsets 104 / 112
                             if (FormatOf(pmt, out var sub, out int w, out int h, out double fps))
-                                r.Add($"pin '{name}' #{i}: {MediaGuids.Name(sub)} {w}x{h} {fps:F1} fps");
+                                r.Add($"pin '{name}' #{i}: {MediaGuids.Name(sub)} {w}x{h} {fps:F1} fps" +
+                                      (size >= 120 ? $" (intervals {Marshal.ReadInt64(caps, 104) / 1e4:F1}..{Marshal.ReadInt64(caps, 112) / 1e4:F1} ms)" : ""));
                             Ole.FreeMediaType(pmt);
                         }
                     Marshal.FreeCoTaskMem(caps);

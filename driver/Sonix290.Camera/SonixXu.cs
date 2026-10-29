@@ -23,6 +23,13 @@ namespace Sonix290
         readonly IntPtr prop = Marshal.AllocCoTaskMem(KspNodeSize);
         readonly IntPtr data = Marshal.AllocCoTaskMem(16);
         public int Transfers;
+        /// <summary>Test only (SxTest --xudelay): extra delay before every XU transfer, to simulate a slow USB port.</summary>
+        public static int DebugDelayMs;
+        /// <summary>
+        /// Test: write the I2C master's command, slave and unused data bytes first and the used data bytes right before
+        /// the trigger, so fewer XU transfers fall between the firmware's per-frame I2C jobs (slow USB ports).
+        /// </summary>
+        public static bool ShortWindow;
 
         SonixXu(IKsControl ks, int node) { this.ks = ks; Node = node; }
 
@@ -76,6 +83,7 @@ namespace Sonix290
             Marshal.WriteInt32(prop, 24, Node);
             Marshal.WriteInt32(prop, 28, 0);
             Marshal.Copy(buf, 0, data, buf.Length);
+            if (DebugDelayMs > 0) Thread.Sleep(DebugDelayMs);
             int hr = ks.KsProperty(prop, KspNodeSize, data, buf.Length, out _);
             Transfers++;
             if (hr != 0) throw new XuException($"XU {(set ? "SET" : "GET")}_CUR failed, HRESULT 0x{hr:X8}");
@@ -104,7 +112,14 @@ namespace Sonix290
             AsicWrite(0x10D8, 1);
             AsicWrite(0x10D0, (byte)(0x80 | ((length & 7) << 4) | ((read ? 1 : 0) << 1)));
             AsicWrite(0x10D1, (byte)slave);
-            for (int i = 0; i < 5; i++) AsicWrite(0x10D2 + i, five[i]);
+            if (ShortWindow)
+            {
+                int used = read ? 0 : Math.Min(length, 5);
+                for (int i = used; i < 5; i++) AsicWrite(0x10D2 + i, five[i]);
+                for (int i = 0; i < used; i++) AsicWrite(0x10D2 + i, five[i]);
+            }
+            else
+                for (int i = 0; i < 5; i++) AsicWrite(0x10D2 + i, five[i]);
             AsicWrite(0x10D7, 0x10);
             Thread.Sleep(5);
             byte status = 0;

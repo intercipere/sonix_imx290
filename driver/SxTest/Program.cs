@@ -34,10 +34,22 @@ static class Program
                                retries); --gap waits between exposures like a client
   com MS [--count N]           exposures through the registered ASCOM driver (ProgID, late binding)
   asic ADDR [N]                read ASIC registers
+  sbwrite MS [--tries N] [--repeats R]   write via STANDBY: retry STANDBY=1 until frames stop, write
+                               VMAX/SHS1 for MS while the sensor is quiet, release; then log frames
+  uvcfps LOG2 [--aep V] [--frames N]   set auto exposure priority V (KS) and the UVC exposure (log2 s),
+                               then log frame intervals: does the firmware stretch the frame itself?
+  sbstat N                     N single STANDBY=1 writes (released after each that took): success rate
+  asicw ADDR VAL [N] [--after MS]   write an ASIC register, (wait MS,) read it back twice (N times,
+                               timed); --poll K: read up to K times until it changes; only for the
+                               I2C master scratch registers 0x10D1-0x10D6 and 0x10D8/0x10D9 (= 1)
+  xuwatch [--ms N] [--regs A,B,..]   poll ASIC registers (default the I2C master 0x10D0-0x10D7) while
+                               streaming, log every change (firmware I2C traffic)
   i2cr REG [N]                 read sensor registers (UNRELIABLE, repeat and compare)
   i2cw REG VAL                 write one sensor register
 
 Global: --set Name=Value (driver setting, repeatable via comma: --set A=1,B=2)   --quiet (no trace on stderr)
+        --xudelay MS (extra delay before every XU transfer: simulates a slow USB port)
+        --short (I2C setup order with the fewest transfers between data and trigger)
 Settings: " ;
 
     static int Main(string[] argv)
@@ -59,6 +71,8 @@ Settings: " ;
                 var p = kv.Split(new[] { '=' }, 2);
                 if (p.Length != 2 || !S.TrySet(p[0], p[1])) { Console.WriteLine("bad setting: " + kv); return 2; }
             }
+        SonixXu.DebugDelayMs = Int("xudelay", 0);
+        SonixXu.ShortWindow = Opt.ContainsKey("short");
         Log.ToConsole = !Opt.ContainsKey("quiet");
         Log.Enabled = true;
         Log.Open("sxtest");
@@ -82,6 +96,11 @@ Settings: " ;
                 case "i2cr": return WithEngine(I2cRead);
                 case "i2cw": return WithEngine(I2cWrite);
                 case "standby": return WithEngine(Standby);
+                case "xuwatch": return WithEngine(XuWatch);
+                case "asicw": return WithEngine(AsicWriteBack);
+                case "sbwrite": return WithEngine(StandbyWrite);
+                case "sbstat": return WithEngine(StandbyStat);
+                case "uvcfps": return WithEngine(UvcFps);
                 default: Console.WriteLine(Usage + S); return 2;
             }
         }
@@ -225,7 +244,7 @@ Settings: " ;
     {
         if (Opt.ContainsKey("vmax"))
             return new SensorTiming { Vmax = Int("vmax", 1125), Shs1 = Int("shs", SensorTiming.LongShs1) };
-        return SensorTiming.For(ms / 1000, e.LineSec, S.BaseVmax);
+        return SensorTiming.For(ms / 1000, e.LineSec, e.BaseVmax);
     }
 
     static int Exp(CameraEngine e)
@@ -238,7 +257,18 @@ Settings: " ;
         var b = LogFrames(e, baseN, null, null);
         Note("baseline: " + Summary(b, 2));
         var sw = Stopwatch.StartNew();
-        e.WriteTiming(t, Int("repeats", S.WriteRepeats), Opt.ContainsKey("burst"));
+        if (Opt.ContainsKey("pause"))
+            e.OnDevice((d, x) =>
+            {
+                // frame delivery paused during the write (the firmware's per-frame I2C job competes otherwise)
+                d.Pause();
+                int ok = 0, tr = 0;
+                for (int i = 0; i < Int("repeats", S.WriteRepeats); i++) { ok += t.Write(x, S.SensorSlave, Opt.ContainsKey("burst"), out int k); tr += k; }
+                Note($"wrote {t} while paused: {ok}/{tr} I2C ok");
+                d.Start();
+                return 0;
+            });
+        else e.WriteTiming(t, Int("repeats", S.WriteRepeats), Opt.ContainsKey("burst"));
         Note($"write took {sw.ElapsedMilliseconds} ms");
         string toggle = null; int at = -1;
         if (Opt.TryGetValue("toggle", out var tg))
@@ -418,6 +448,236 @@ Settings: " ;
     {
         int a = ParseInt(Args[1]), n = Args.Count > 2 ? ParseInt(Args[2]) : 1;
         e.OnDevice((d, x) => { for (int i = 0; i < n; i++) Note($"ASIC 0x{a + i:X4} = 0x{x.AsicRead(a + i):X2}"); return 0; });
+        return 0;
+    }
+
+    static int UvcFps(CameraEngine e)
+    {
+        int log2 = ParseInt(Args[1]);
+        if (Opt.TryGetValue("aep", out var av))
+            Note($"auto exposure priority -> {av}: hr=0x{e.SetKsControl(19, ParseInt(av)):X8}");
+        e.OnDevice((d, x) =>
+        {
+            d.CameraControl.Get(4, out int v, out int fl);
+            int hr = d.CameraControl.Set(4, log2, 2);
+            Note($"UVC exposure {v} -> {log2}: hr=0x{hr:X8}");
+            return 0;
+        });
+        var s = LogFrames(e, Int("frames", 10), null, null);
+        Note("result: " + Summary(s, 2));
+        return 0;
+    }
+
+    static int StandbyStat(CameraEngine e)
+    {
+        int n = ParseInt(Args[1]), took = 0;
+        double sum = 0;
+        LogFrames(e, 5, null, null);
+        for (int i = 1; i <= n; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            e.OnDevice((d, x) => x.SensorWrite(S.SensorSlave, 0x3000, 1));
+            sum += sw.Elapsed.TotalMilliseconds;
+            Thread.Sleep(150);
+            long c = e.Frames.Count;
+            Thread.Sleep(150);
+            bool quiet = e.Frames.Count == c;
+            if (!quiet) { Console.Write("."); continue; }
+            took++;
+            Console.Write("+");
+            for (int k = 0; k < 30; k++)
+            {
+                c = e.Frames.Count;
+                e.OnDevice((d, x) => x.SensorWrite(S.SensorSlave, 0x3000, 0));
+                if (e.Frames.WaitFrom(c, TimeSpan.FromMilliseconds(400), CancellationToken.None) != null) break;
+            }
+        }
+        Console.WriteLine();
+        Note($"STANDBY=1 took {took}/{n}, mean write {sum / n:F0} ms");
+        return 0;
+    }
+
+    static int StandbyWrite(CameraEngine e)
+    {
+        double ms = Ms(Args[1]);
+        var t = TimingFromArgs(e, ms);
+        int tries = Int("tries", 10), repeats = Int("repeats", 1);
+        var b = LogFrames(e, 10, null, null);
+        Note("before: " + Summary(b, 2));
+        var total = Stopwatch.StartNew();
+        bool quiet = false;
+        for (int i = 1; i <= tries && !quiet; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            bool st = e.OnDevice((d, x) => x.SensorWrite(S.SensorSlave, 0x3000, 1));
+            double w = sw.Elapsed.TotalMilliseconds;
+            // the running frame is cut and flushed; after that no frame may arrive while in STANDBY
+            Thread.Sleep(120);
+            long c = e.Frames.Count;
+            Thread.Sleep(100);
+            quiet = e.Frames.Count == c;
+            Note($"STANDBY=1 try {i}: {w:F0} ms (status {(st ? "ok" : "fail")}), {(quiet ? "frames stopped" : "frames continue")}");
+        }
+        if (!quiet) { Note("STANDBY did not take"); return 1; }
+        var ws = Stopwatch.StartNew();
+        int ok = 0, tr = 0;
+        e.OnDevice((d, x) =>
+        {
+            for (int i = 0; i < repeats; i++) { ok += t.Write(x, S.SensorSlave, true, out int k); tr += k; }
+            return 0;
+        });
+        Note($"wrote {t} x{repeats} burst in STANDBY: {ok}/{tr} I2C ok, {ws.ElapsedMilliseconds} ms");
+        // release; frames must resume (retry like the set)
+        bool running = false;
+        for (int i = 1; i <= tries && !running; i++)
+        {
+            long c = e.Frames.Count;
+            var sw = Stopwatch.StartNew();
+            bool st = e.OnDevice((d, x) => x.SensorWrite(S.SensorSlave, 0x3000, 0));
+            double w = sw.Elapsed.TotalMilliseconds;
+            running = e.Frames.WaitFrom(c, TimeSpan.FromSeconds(t.Period(e.LineSec) + 1), CancellationToken.None) != null;
+            Note($"STANDBY=0 try {i}: {w:F0} ms (status {(st ? "ok" : "fail")}), {(running ? "frames resumed" : "no frame")}");
+        }
+        Note($"total {total.ElapsedMilliseconds} ms until the first frame");
+        string save = Opt.TryGetValue("save", out var sd) ? sd : null;
+        var a = LogFrames(e, Int("frames", 5), save == null ? null : Path.Combine(save, "before"), null);
+        Note("after: " + Summary(a, 1));
+        if (Opt.TryGetValue("w", out var ws2))
+        {
+            // test: write sensor registers (REG=VAL,...) at the long frame, under REGHOLD, twice
+            var pairs = ws2.Split(',').Select(kv => kv.Split('=')).Select(kv => (reg: ParseInt(kv[0]), val: ParseInt(kv[1]))).ToArray();
+            e.OnDevice((d, x) =>
+            {
+                for (int k = 0; k < 2; k++)
+                {
+                    x.SensorWrite(S.SensorSlave, 0x3001, 1);
+                    foreach (var (reg, val) in pairs) x.SensorWrite(S.SensorSlave, reg, (byte)val);
+                    x.SensorWrite(S.SensorSlave, 0x3001, 0);
+                }
+                return 0;
+            });
+            Note("wrote " + ws2);
+            LogFrames(e, 2, null, null);   // transition
+            var w = LogFrames(e, Int("frames", 5), save == null ? null : Path.Combine(save, "written"), null);
+            Note("after register writes: " + Summary(w, 1));
+        }
+        // follow-up at the long frame: STANDBY toggles (taken = next frame ~ period + 45 ms after release)
+        double period = t.Period(e.LineSec) * 1000;
+        int toggles = Int("toggles", 0), takenT = 0;
+        for (int i = 0; i < toggles; i++)
+        {
+            e.Frames.WaitFrom(e.Frames.Count, TimeSpan.FromSeconds(period / 1000 + 2), CancellationToken.None);
+            Thread.Sleep((int)(period * ((i * 0.37) % 0.8)));
+            bool on = false, off = false;
+            e.OnDevice((d, x) => { on = x.SensorWrite(S.SensorSlave, 0x3000, 1); off = x.SensorWrite(S.SensorSlave, 0x3000, 0); return 0; });
+            long rel = Stopwatch.GetTimestamp();
+            Frame f;
+            double dt;
+            do
+            {
+                f = e.Frames.WaitFrom(e.Frames.Count, TimeSpan.FromSeconds(period / 1000 + 2), CancellationToken.None);
+                dt = f == null ? -1 : (f.Ticks - rel) * 1000.0 / Stopwatch.Frequency;
+            } while (f != null && dt < 200);
+            bool taken = f != null && Math.Abs(dt - period - 45) < 60;
+            if (taken) takenT++;
+            Note($"toggle {i}: next frame {dt:F0} ms after release (taken would be ~{period + 45:F0}) -> {(taken ? "taken" : "not taken")}");
+        }
+        if (toggles > 0) Note($"toggles taken {takenT}/{toggles}");
+        if (Opt.TryGetValue("reopen", out var ro))
+        {
+            // rebuild the graph with another frame interval: does the long VMAX survive the format change?
+            var sw = Stopwatch.StartNew();
+            e.Reopen(Ms(ro));
+            Note($"reopened at interval {ro} ms in {sw.ElapsedMilliseconds} ms; line now {e.LineSec * 1e6:F2} us, {t} -> {t.Period(e.LineSec) * 1000:F0} ms if VMAX survived");
+            var c = LogFrames(e, 4, null, null);
+            Note("after reopen: " + Summary(c, 1));
+        }
+        if (Opt.TryGetValue("then", out var then))
+        {
+            var t2 = SensorTiming.For(Ms(then) / 1000, e.LineSec, e.BaseVmax);
+            int n2 = Int("thenrepeats", 1);
+            e.OnDevice((d, x) => { for (int i = 0; i < n2; i++) t2.Write(x, S.SensorSlave, true, out _); return 0; });
+            Note($"wrote {t2} x{n2} normally (no STANDBY), expected period {t2.Period(e.LineSec) * 1000:F0} ms");
+            var c = LogFrames(e, 4, null, null);
+            Note("then: " + Summary(c, 1));
+        }
+        return 0;
+    }
+
+    static int AsicWriteBack(CameraEngine e)
+    {
+        int a = ParseInt(Args[1]), v = ParseInt(Args[2]), n = Args.Count > 3 ? ParseInt(Args[3]) : 1;
+        int after = Int("after", 0), poll = Int("poll", 0), stagger = Int("stagger", 0);
+        bool flag = a == 0x10D8 || a == 0x10D9;   // documented "pre-set to 1": only the value 1
+        if ((a < 0x10D1 || a > 0x10D6) && !flag) { Note("refused: only 0x10D1-0x10D6, or 0x10D8/0x10D9 = 1"); return 2; }
+        if (flag) v = 1;
+        e.OnDevice((d, x) =>
+        {
+            if (Opt.ContainsKey("pause")) d.Pause();
+            for (int i = 0; i < n; i++)
+            {
+                byte val = flag ? (byte)1 : (byte)(v + i);
+                if (stagger > 0)
+                {
+                    // start each write at a different phase after a frame arrival
+                    long c = e.Frames.Count;
+                    e.Frames.WaitFrom(c, TimeSpan.FromSeconds(2), CancellationToken.None);
+                    Thread.Sleep(i * stagger % 33);
+                }
+                var sw = Stopwatch.StartNew();
+                x.AsicWrite(a, val);
+                double w = sw.Elapsed.TotalMilliseconds;
+                if (after > 0) Thread.Sleep(after);
+                if (poll > 0)
+                {
+                    // reads until the value changes; logs the time of each read since the write started
+                    var seen = new List<string>();
+                    for (int k = 0; k < poll; k++)
+                    {
+                        byte p = x.AsicRead(a);
+                        double sinceFrame = (Stopwatch.GetTimestamp() - e.Frames.LastTicks) * 1000.0 / Stopwatch.Frequency;
+                        seen.Add($"{sw.Elapsed.TotalMilliseconds:F0}:{p:X2}(f+{sinceFrame:F0})");
+                        if (p != val) break;
+                    }
+                    Note($"0x{a:X4} <- 0x{val:X2} ({w:F1} ms), frame {e.Frames.Count}: {string.Join(" ", seen)}");
+                    continue;
+                }
+                byte back = x.AsicRead(a), again = x.AsicRead(a);
+                Note($"0x{a:X4} <- 0x{val:X2} ({w:F1} ms), read back 0x{back:X2} then 0x{again:X2}{(back == val ? "" : "  MISMATCH")}");
+            }
+            if (Opt.ContainsKey("pause")) d.Start();
+            return 0;
+        });
+        return 0;
+    }
+
+    static int XuWatch(CameraEngine e)
+    {
+        int ms = Int("ms", 3000);
+        int[] regs = Opt.TryGetValue("regs", out var rs) ? rs.Split(',').Select(ParseInt).ToArray()
+                                                           : Enumerable.Range(0x10D0, 8).ToArray();
+        Note($"watching {string.Join(",", regs.Select(r => "0x" + r.ToString("X4")))} for {ms} ms");
+        e.OnDevice((d, x) =>
+        {
+            var last = new int[regs.Length];
+            for (int i = 0; i < last.Length; i++) last[i] = -1;
+            var sw = Stopwatch.StartNew();
+            int loops = 0, changes = 0;
+            while (sw.ElapsedMilliseconds < ms)
+            {
+                var now = regs.Select(r => (int)x.AsicRead(r)).ToArray();
+                loops++;
+                if (!now.SequenceEqual(last))
+                {
+                    changes++;
+                    Note($"{sw.Elapsed.TotalMilliseconds,8:F1} ms frame {e.Frames.Count}: " +
+                         string.Join(" ", now.Select(v => v.ToString("X2"))));
+                    last = now;
+                }
+            }
+            Note($"{loops} loops ({ms / (double)loops:F1} ms each), {changes} changes, {e.Frames.Count} frames so far");
+            return 0;
+        });
         return 0;
     }
 

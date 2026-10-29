@@ -42,7 +42,17 @@ namespace Sonix290
         public bool IsOpen => dev != null;
         public string DeviceName => dev?.Name;
         public FrameBuffer Frames => frames;
-        public double LineSec => Settings.LineTimeUs * 1e-6;
+        /// <summary>1H. The firmware doubles it at 15 fps instead of VMAX (measured 58.18 us; VMAX 17191 -> 1000.1 ms).</summary>
+        public double LineSec => Settings.LineTimeUs * 1e-6 * LineFactor;
+        double LineFactor => dev != null && dev.Fps > 0 && dev.Fps < 20 ? 2 : 1;
+        /// <summary>Slow USB port mode (see Settings.SlowPortReadMs).</summary>
+        public bool SlowPort { get; private set; }
+        /// <summary>Mean ASIC read time measured at connect (ms).</summary>
+        public double XuReadMs { get; private set; }
+        /// <summary>VMAX below which SHS1 sets the exposure; in slow port mode the frame never gets shorter than the floor.</summary>
+        public int BaseVmax => SlowPort
+            ? Math.Max(Settings.BaseVmax, (int)Math.Round(Settings.SlowPortMinPeriodMs / 1000 / LineSec))
+            : Settings.BaseVmax;
         public int GainMin { get; private set; }
         public int GainMax { get; private set; }
         public bool HasGain { get; private set; }
@@ -81,6 +91,8 @@ namespace Sonix290
         [System.Runtime.InteropServices.DllImport("winmm.dll")] static extern int timeBeginPeriod(int ms);
         [System.Runtime.InteropServices.DllImport("winmm.dll")] static extern int timeEndPeriod(int ms);
         bool timerRaised, wroteTiming, usedStandby;
+        /// <summary>Slow port mode: the sensor has left the short default frames (bootstrap through STANDBY done).</summary>
+        bool escaped;
 
         /// <summary>Opens and starts the camera. On failure call Dispose (it releases the device).</summary>
         public void Open()
@@ -89,15 +101,42 @@ namespace Sonix290
             // Default Windows timer resolution (15.6 ms) would stretch the I2C polling sleeps 3-4x.
             if (!timerRaised) timerRaised = timeBeginPeriod(1) == 0;
             var sub = Settings.Format.Equals("YUY2", StringComparison.OrdinalIgnoreCase) ? MediaGuids.Yuy2 : MediaGuids.Mjpg;
+            StartDevice(sub, Settings.FrameIntervalMs);
             com.Run(() =>
             {
-                dev = UvcDevice.Open(Settings.DeviceMatch, Settings.Width, Settings.Height, sub, frames);
+                var sw = Stopwatch.StartNew();
+                const int reads = 6;
+                for (int i = 0; i < reads; i++) xu.AsicRead(0x101F);
+                XuReadMs = sw.Elapsed.TotalMilliseconds / reads;
+            });
+            SlowPort = XuReadMs > Settings.SlowPortReadMs;
+            Log.Write($"ASIC read {XuReadMs:F1} ms (slow port threshold {Settings.SlowPortReadMs} ms)" +
+                      (SlowPort ? ": slow USB port mode. WARNING: the image may be grainier on this port (15 fps " +
+                                  "mode); for guiding use a port on the CPU's USB controller" : ""));
+            if (SlowPort && Settings.FrameIntervalMs <= 0 && sub == MediaGuids.Mjpg)
+            {
+                // 15 fps doubles the time between the firmware's I2C jobs, which the STANDBY bootstrap needs
+                // (2026-10-29: STANDBY took 0/30 at 30 fps, 4/30 at 15 fps on the chipset port).
+                com.Run(() => { xu.Dispose(); xu = null; dev.Dispose(); dev = null; });
+                frames.BreakChain();
+                StartDevice(sub, 66.6667);
+            }
+            applied = null;
+            escaped = false;
+        }
+
+        void StartDevice(Guid sub, double intervalMs)
+        {
+            long first = frames.Count;
+            com.Run(() =>
+            {
+                dev = UvcDevice.Open(Settings.DeviceMatch, Settings.Width, Settings.Height, sub, intervalMs, frames);
                 Log.Write($"device '{dev.Name}' {MediaGuids.Name(dev.SubType)} {dev.Width}x{dev.Height} {dev.Fps:F1} fps, {dev.Path}");
                 ConfigureControls();
                 dev.Start();
             });
             // A frame length left from an earlier session can make the first frame take up to 7.6 s.
-            if (frames.WaitFrom(0, TimeSpan.FromSeconds(20), CancellationToken.None) == null)
+            if (frames.WaitFrom(first, TimeSpan.FromSeconds(20), CancellationToken.None) == null)
             {
                 throw new InvalidOperationException(
                     "Camera delivers no frames (in use by another program, or camera access for desktop apps off in Windows privacy settings?)");
@@ -109,7 +148,6 @@ namespace Sonix290
                 bool ack = xu.Probe(Settings.SensorSlave);
                 Log.Write($"sensor slave 0x{Settings.SensorSlave:X2} ack: {ack}");
             });
-            applied = null;
         }
 
         void ConfigureControls()
@@ -261,6 +299,59 @@ namespace Sonix290
         /// <summary>Makes sure the sensor is not left in STANDBY (the release write may not have landed).</summary>
         void ReleaseStandby() => com.Run(() => xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0));
 
+        /// <summary>Longest the slow port bootstrap tries to get STANDBY through.</summary>
+        const double BootstrapLimitSec = 30;
+        /// <summary>STANDBY writes per check (each ~13 % at 15 fps on the chipset port; a check costs ~2 writes).</summary>
+        const int BootstrapWritesPerCheck = 3;
+
+        /// <summary>
+        /// Slow port mode: a write while the frames are short loses against the firmware's per-frame I2C job. STANDBY
+        /// is a single I2C write, retried until the frames stop; in STANDBY the firmware leaves the I2C master alone,
+        /// so VMAX/SHS1 are written then, and the release restarts the frame. Returns the release time.
+        /// </summary>
+        long Bootstrap(SensorTiming t, CancellationToken ct)
+        {
+            var sw = Stopwatch.StartNew();
+            double period = Math.Min(Math.Max(frames.LastHostDt, 0.03), 8);
+            // the running frame is cut and flushed (~45 ms); after that no frame may arrive while in STANDBY
+            int settleMs = (int)(period * 1000) + 60, quietMs = (int)(period * 2000) + 20;
+            int tries = 0;
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (sw.Elapsed.TotalSeconds > BootstrapLimitSec)
+                    throw new InvalidOperationException(
+                        $"camera did not take the exposure ({t}): its register access is slow on this USB port " +
+                        $"({XuReadMs:F0} ms per read) and STANDBY did not take in {tries} writes; connect the camera to " +
+                        "another USB port (on desktop PCs: a rear port on the CPU's USB controller)");
+                tries += BootstrapWritesPerCheck;
+                com.Run(() => { for (int i = 0; i < BootstrapWritesPerCheck; i++) xu.SensorWrite(Settings.SensorSlave, StandbyReg, 1); });
+                Thread.Sleep(settleMs);
+                long c = frames.Count;
+                Thread.Sleep(quietMs);
+                if (frames.Count == c) break;
+            }
+            usedStandby = true;
+            long ws = sw.ElapsedMilliseconds;
+            int ok = 0, total = 0;
+            com.Run(() => { ok = t.Write(xu, Settings.SensorSlave, Settings.BurstWrites, out total); });
+            wroteTiming = true;
+            long release = 0;
+            for (int i = 0; i < 10; i++)
+            {
+                long c = frames.Count;
+                com.Run(() => xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0));
+                release = Stopwatch.GetTimestamp();
+                // the first frame after the release ends one period later
+                if (frames.WaitFrom(c, TimeSpan.FromSeconds(t.Period(LineSec) + 1), ct) != null) break;
+                Log.Write("bootstrap: no frame after the STANDBY release, releasing again");
+            }
+            Log.Write($"bootstrap: STANDBY took within {tries} writes ({ws} ms), wrote {t} in STANDBY ({ok}/{total} I2C ok), " +
+                      $"{sw.ElapsedMilliseconds} ms in all");
+            escaped = true;
+            return release;
+        }
+
         /// <summary>
         /// Consecutive invalid frames before the stream is restarted. They arrive at the right intervals, so the timing
         /// is fine and a VMAX rewrite does not help (measured: 8-byte frames through 3 rewrites in PHD2); a graph
@@ -289,7 +380,7 @@ namespace Sonix290
             lock (exposeGate)
             {
                 if (dev == null) throw new InvalidOperationException("not connected");
-                var t = SensorTiming.For(seconds, LineSec, Settings.BaseVmax);
+                var t = SensorTiming.For(seconds, LineSec, BaseVmax);
                 double expected = t.Period(LineSec);
                 var r = new ExposureResult { Requested = seconds, Timing = t, ExpectedPeriod = expected };
                 long t0 = Stopwatch.GetTimestamp();
@@ -316,7 +407,11 @@ namespace Sonix290
                             $"camera did not take the exposure ({t}) after {r.Applies} write attempts; last: {why}");
                     if (r.Applies > 0) Log.Write($"rewriting {t}: {why}");
                     phase?.Invoke("applying " + t);
-                    WriteTiming(t);
+                    // Slow port: the first write and every rewrite go through STANDBY (a failed write may have left
+                    // the short default frames, where normal writes lose).
+                    bool boot = SlowPort && (!escaped || r.Applies > 0);
+                    long release = boot ? Bootstrap(t, ct) : 0;
+                    if (!boot) WriteTiming(t);
                     r.Applies++;
                     confirmed = false;
                     notBefore = Stopwatch.GetTimestamp();
@@ -327,7 +422,13 @@ namespace Sonix290
                     skipFirst = expected < VerifyWindowSec ? 1 : 0;
                     windowN = 0;
                     badInRow = 0;
-                    if (standby) Restart();
+                    if (boot)
+                    {
+                        // the release restarted the frame like a STANDBY restart
+                        notBefore = release;
+                        flushUntil = release + (long)(StandbyFlushSec * Stopwatch.Frequency);
+                    }
+                    else if (standby) Restart();
                 }
 
                 if (!confirmed) Write("new timing");
@@ -437,6 +538,14 @@ namespace Sonix290
 
         internal int SetKsControl(int id, int value) => com.Run(() => SetKsCameraControl(id, value));
 
+        /// <summary>Test path: rebuild the graph with another UVC frame interval (0 = the format's default).</summary>
+        internal void Reopen(double intervalMs)
+        {
+            com.Run(() => { xu.Dispose(); xu = null; dev.Dispose(); dev = null; });
+            frames.BreakChain();
+            StartDevice(Settings.Format.Equals("YUY2", StringComparison.OrdinalIgnoreCase) ? MediaGuids.Yuy2 : MediaGuids.Mjpg, intervalMs);
+        }
+
         void Close()
         {
             com.Run(() =>
@@ -447,7 +556,7 @@ namespace Sonix290
                     try
                     {
                         if (usedStandby) xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0);
-                        WriteTiming(new SensorTiming { Vmax = Settings.BaseVmax, Shs1 = SensorTiming.LongShs1 });
+                        WriteTiming(new SensorTiming { Vmax = Settings.BaseVmax, Shs1 = SensorTiming.LongShs1 }, SlowPort ? 1 : (int?)null);
                     }
                     catch (Exception e) { Log.Write("reset to base timing failed: " + e.Message); }
                 }

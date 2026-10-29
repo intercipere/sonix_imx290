@@ -18,6 +18,8 @@ namespace Sonix290
         public int Width { get; set; } = 1920;
         public int Height { get; set; } = 1080;
         public string Format { get; set; } = "MJPG";
+        /// <summary>UVC frame interval requested at connect in ms (0 = the format's default, 33.3; MJPEG allows up to 66.7).</summary>
+        public double FrameIntervalMs { get; set; } = 0;
         public int SensorSlave { get; set; } = 0x1A;
         /// <summary>1H in microseconds (measured, MJPEG 1080p: 29.10 on Linux, 29.099 on Windows).</summary>
         public double LineTimeUs { get; set; } = 29.10;
@@ -40,6 +42,16 @@ namespace Sonix290
         /// of XU traffic). Replaces AcceptEarlyStartPct for those exposures.
         /// </summary>
         public bool StandbyRestart { get; set; } = true;
+        /// <summary>
+        /// Slow USB port mode when an ASIC read takes longer than this at connect (ms; 0 = always, 1000 = never).
+        /// Measured 2026-10-29 (Ryzen, AMD 500-series): CPU USB controller ~2 ms, chipset controller ~27 ms. On the
+        /// slow port the firmware's per-frame I2C job wipes our half-written I2C setup at 30 fps (0/105 writes took).
+        /// The mode streams at 15 fps, escapes the short frames once through a retried STANDBY, and keeps the frame
+        /// period at least SlowPortMinPeriodMs, where writes work normally (8/8 STANDBY toggles, 1/1 rewrites).
+        /// </summary>
+        public double SlowPortReadMs { get; set; } = 8;
+        /// <summary>Shortest frame period in slow USB port mode; shorter exposures use SHS1 inside it.</summary>
+        public double SlowPortMinPeriodMs { get; set; } = 250;
         public int MaxApplyAttempts { get; set; } = 3;
         /// <summary>UVC exposure set once at connect, DirectShow log2 seconds (-5 = 31 ms).</summary>
         public int UvcExposureLog2 { get; set; } = -5;

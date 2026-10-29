@@ -109,7 +109,9 @@ namespace Sonix290
             }
         }
 
-        public string Description => FriendlyName;
+        public string Description => engine != null && engine.SlowPort
+            ? FriendlyName + " (slow USB port: image may be grainier, see README)"
+            : FriendlyName;
         public string DriverInfo => "Sonix SN9C292B + IMX290/291 UVC camera; long exposures by writing the sensor frame length over the UVC extension unit. Version " + DriverVersion;
         public string DriverVersion
         {

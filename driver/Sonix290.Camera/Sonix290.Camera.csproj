@@ -4,9 +4,12 @@
     <OutputType>Library</OutputType>
     <AssemblyName>ASCOM.Sonix290.Camera</AssemblyName>
     <RootNamespace>Sonix290</RootNamespace>
-    <Version>0.5.0</Version>
+    <Version>0.6.1</Version>
     <Deterministic>true</Deterministic>
     <PathMap>$(MSBuildProjectDirectory)=/src/$(MSBuildProjectName)</PathMap>
+    <!-- the SDK's SourceLink would embed the local repo path in the PDB -->
+    <EnableSourceLink>false</EnableSourceLink>
+    <EnableSourceControlManagerQueries>false</EnableSourceControlManagerQueries>
     <Product>Sonix IMX290 ASCOM camera driver</Product>
     <PlatformTarget>AnyCPU</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
