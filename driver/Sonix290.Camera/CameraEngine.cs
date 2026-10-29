@@ -298,6 +298,29 @@ namespace Sonix290
             return release;
         }
 
+        /// <summary>
+        /// VMAX/SHS1 written once while the sensor is in STANDBY: the firmware's per-frame I2C job, which otherwise
+        /// wipes or garbles about a third of the writes, is idle then. The release restarts the frame. Returns the
+        /// release time.
+        /// </summary>
+        long StandbyWrite(SensorTiming t)
+        {
+            var sw = Stopwatch.StartNew();
+            bool on = false, off = false;
+            int ok = 0, total = 0;
+            com.Run(() =>
+            {
+                on = xu.SensorWrite(Settings.SensorSlave, StandbyReg, 1);
+                ok = t.Write(xu, Settings.SensorSlave, Settings.BurstWrites, out total);
+                off = xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0);
+            });
+            long release = Stopwatch.GetTimestamp();
+            usedStandby = wroteTiming = true;
+            Log.Write($"wrote {t} in a STANDBY toggle: {ok}/{total} I2C ok ({(on ? "ok" : "fail")}/{(off ? "ok" : "fail")}), " +
+                      $"{sw.ElapsedMilliseconds} ms");
+            return release;
+        }
+
         /// <summary>Makes sure the sensor is not left in STANDBY (the release write may not have landed).</summary>
         void ReleaseStandby() => com.Run(() => xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0));
 
@@ -358,8 +381,10 @@ namespace Sonix290
         /// Consecutive invalid frames before the stream is restarted. They arrive at the right intervals, so the timing
         /// is fine and a VMAX rewrite does not help (measured: 8-byte frames through 3 rewrites in PHD2); a graph
         /// Stop/Run cleared them every time (2026-10-29). Seen after the first write in ~1 of 3 32-bit connects.
+        /// Once they start, every later frame is 8 bytes until the restart (PC 2: all of ~20 cases), so the first
+        /// one is enough and saves a whole exposure.
         /// </summary>
-        const int MaxInvalidInRow = 2;
+        const int MaxInvalidInRow = 1;
 
         /// <summary>A frame the camera really encoded (8-byte samples appear after some VMAX writes).</summary>
         bool ValidPayload(Frame f) =>
@@ -412,8 +437,8 @@ namespace Sonix290
                     // Slow port: the first write and every rewrite go through STANDBY (a failed write may have left
                     // the short default frames, where normal writes lose).
                     bool boot = SlowPort && (!escaped || r.Applies > 0);
-                    long release = boot ? Bootstrap(t, ct) : 0;
-                    if (!boot) WriteTiming(t);
+                    long release = boot ? Bootstrap(t, ct) : Settings.StandbyWrites ? StandbyWrite(t) : 0;
+                    if (release == 0) WriteTiming(t);
                     r.Applies++;
                     confirmed = false;
                     notBefore = Stopwatch.GetTimestamp();
@@ -424,7 +449,7 @@ namespace Sonix290
                     skipFirst = expected < VerifyWindowSec ? 1 : 0;
                     windowN = 0;
                     badInRow = 0;
-                    if (boot)
+                    if (release != 0)
                     {
                         // the release restarted the frame like a STANDBY restart
                         notBefore = release;
@@ -557,8 +582,13 @@ namespace Sonix290
                 {
                     try
                     {
-                        if (usedStandby) xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0);
-                        WriteTiming(new SensorTiming { Vmax = Settings.BaseVmax, Shs1 = SensorTiming.LongShs1 }, SlowPort ? 1 : (int?)null);
+                        var b = new SensorTiming { Vmax = Settings.BaseVmax, Shs1 = SensorTiming.LongShs1 };
+                        if (Settings.StandbyWrites) StandbyWrite(b);
+                        else
+                        {
+                            if (usedStandby) xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0);
+                            WriteTiming(b, SlowPort ? 1 : (int?)null);
+                        }
                     }
                     catch (Exception e) { Log.Write("reset to base timing failed: " + e.Message); }
                 }

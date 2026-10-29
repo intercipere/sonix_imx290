@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.3
+
+- **Timing writes are reliable on fast ports too.** The camera firmware's own per-frame sensor write overwrote or
+  garbled about a third of the driver's writes at 30 fps (measured: 6/20 single writes took, 17/20 with three;
+  occasionally a wrong frame length). The driver now writes VMAX/SHS1 once while the sensor is in STANDBY
+  (STANDBY on, write, STANDBY off): 135/135 test writes took, and every timing change in the driver tests took on
+  the first write. The first exposure after connecting is ~0.2 s faster. Setting `StandbyWrites` (default on).
+- The camera's stuck 8-byte frames (which follow about 1 in 20 such writes) are now cleared after the first one
+  instead of the second, saving one exposure period.
+- Disconnecting resets the camera to 30 fps the same way, so the next program finds it at its default.
+- SxTest: `wstat` (write statistics), `driver --seq` (cycle exposure times).
+
 ## 0.6.2
 
 - Connecting in slow USB port mode shows a warning box (the client waits until OK is clicked): PHD2 does not
@@ -22,7 +34,7 @@
   `--short`, `exp --pause`; `formats` shows the frame interval range.
 - The README in the package no longer mentions the removed issue template.
 - Known issue: on a fast port the first timing write after plugging in occasionally does not take or is followed
-  by 8-byte frames that a stream restart does not always clear; reconnecting helps.
+  by 8-byte frames that a stream restart does not always clear; reconnecting helps (fixed in 0.6.3).
 
 ## 0.5.0 – first public test release
 

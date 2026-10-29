@@ -26,6 +26,13 @@ namespace Sonix290
         /// <summary>VMAX the firmware uses at 30 fps; below its frame time SHS1 sets the exposure.</summary>
         public int BaseVmax { get; set; } = 1125;
         public int WriteRepeats { get; set; } = 3;
+        /// <summary>
+        /// Write VMAX/SHS1 once inside a STANDBY toggle (STANDBY 1, timing, STANDBY 0) instead of WriteRepeats times
+        /// into the running sensor. PC 2, CPU port, 2026-10-29: 120/120 took (incl. right after a stream restart and at
+        /// 1 s), against 6/20 for one plain burst write and 17/20 for three; the release also restarts the frame.
+        /// About 1 in 20 is followed by the sticky 8-byte frames, which a stream restart clears.
+        /// </summary>
+        public bool StandbyWrites { get; set; } = true;
         /// <summary>Write VMAX and SHS1 as 3-byte I2C bursts (measured: x3 bursts as reliable as x3 normal writes, half the time).</summary>
         public bool BurstWrites { get; set; } = true;
         public double VerifyTolPct { get; set; } = 1.5;

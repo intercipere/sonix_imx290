@@ -30,7 +30,7 @@ static class Program
                                N times (waiting c*stagger ms before restart c); logs first frames after each
   standby MS [--cycles N] [--stagger MS] [--hold MS] [--reg R]   set MS, then toggle STANDBY (0x3000, or R)
                                at staggered points of the frame; logs first frames after each release
-  driver MS [--count N] [--save DIR] [--gap MS]   exposures through the driver engine (verification,
+  driver MS [--count N] [--save DIR] [--gap MS] [--seq MS,MS,..]   exposures through the driver engine (verification,
                                retries); --gap waits between exposures like a client
   com MS [--count N]           exposures through the registered ASCOM driver (ProgID, late binding)
   asic ADDR [N]                read ASIC registers
@@ -38,6 +38,9 @@ static class Program
                                VMAX/SHS1 for MS while the sensor is quiet, release; then log frames
   uvcfps LOG2 [--aep V] [--frames N]   set auto exposure priority V (KS) and the UVC exposure (log2 s),
                                then log frame intervals: does the firmware stretch the frame itself?
+  wstat N [--method normal|normaltoggle|standby|standbyfast] [--repeats R] [--restart] [--ms MS]   N timing writes from the
+                               30 fps default (to MS, default 200), each judged by the frame interval, reset to
+                               30 fps through STANDBY after each; --restart: graph Stop/Run before each write
   sbstat N                     N single STANDBY=1 writes (released after each that took): success rate
   asicw ADDR VAL [N] [--after MS]   write an ASIC register, (wait MS,) read it back twice (N times,
                                timed); --poll K: read up to K times until it changes; only for the
@@ -100,6 +103,7 @@ Settings: " ;
                 case "asicw": return WithEngine(AsicWriteBack);
                 case "sbwrite": return WithEngine(StandbyWrite);
                 case "sbstat": return WithEngine(StandbyStat);
+                case "wstat": return WithEngine(WriteStat);
                 case "uvcfps": return WithEngine(UvcFps);
                 default: Console.WriteLine(Usage + S); return 2;
             }
@@ -398,6 +402,7 @@ Settings: " ;
     {
         double ms = Ms(Args[1]);
         int count = Int("count", 5);
+        double[] seq = Opt.TryGetValue("seq", out var sq) ? sq.Split(',').Select(Ms).ToArray() : new[] { ms };
         string dir = Opt.TryGetValue("save", out var d) ? d : null;
         if (dir != null) Directory.CreateDirectory(dir);
         Console.WriteLine("# n requested_ms expected_ms measured_ms applies skipped total_s meanY");
@@ -406,6 +411,7 @@ Settings: " ;
         for (int i = 0; i < count; i++)
         {
             if (i > 0 && gap > 0) Thread.Sleep(gap);
+            ms = seq[i % seq.Length];
             var r = e.Expose(ms / 1000, CancellationToken.None, p => Note(p));
             var pic = e.Decode(r.Frame, false);
             Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0} {1} {2:F1} {3:F1} {4} {5} {6:F2} {7:F2}",
@@ -465,6 +471,138 @@ Settings: " ;
         });
         var s = LogFrames(e, Int("frames", 10), null, null);
         Note("result: " + Summary(s, 2));
+        return 0;
+    }
+
+    /// <summary>STANDBY=1 (retried until frames stop), timing write in STANDBY, release until a frame arrives.</summary>
+    static bool StandbyApply(CameraEngine e, SensorTiming t, double periodSec, out int tries)
+    {
+        tries = 0;
+        int settle = (int)(periodSec * 1000) + 60, quiet = (int)(periodSec * 2000) + 20;
+        bool stopped = false;
+        while (!stopped && tries < 10)
+        {
+            tries++;
+            e.OnDevice((d, x) => x.SensorWrite(S.SensorSlave, 0x3000, 1));
+            Thread.Sleep(settle);
+            long c = e.Frames.Count;
+            Thread.Sleep(quiet);
+            stopped = e.Frames.Count == c;
+        }
+        if (!stopped) return false;
+        e.OnDevice((d, x) => { t.Write(x, S.SensorSlave, true, out _); return 0; });
+        for (int k = 0; k < 10; k++)
+        {
+            long c = e.Frames.Count;
+            e.OnDevice((d, x) => x.SensorWrite(S.SensorSlave, 0x3000, 0));
+            if (e.Frames.WaitFrom(c, TimeSpan.FromSeconds(t.Period(e.LineSec) + 1), CancellationToken.None) != null) return true;
+        }
+        return false;
+    }
+
+    static int WriteStat(CameraEngine e)
+    {
+        int n = ParseInt(Args[1]), repeats = Int("repeats", S.WriteRepeats);
+        string method = Opt.TryGetValue("method", out var m) ? m : "normal";
+        bool restart = Opt.ContainsKey("restart");
+        double ms = Opt.TryGetValue("ms", out var mv) ? Ms(mv) : 200;
+        var target = SensorTiming.For(ms / 1000, e.LineSec, S.BaseVmax);
+        var baseT = new SensorTiming { Vmax = S.BaseVmax, Shs1 = SensorTiming.LongShs1 };
+        double expected = target.Period(e.LineSec), basePeriod = baseT.Period(e.LineSec);
+        Note($"{n} writes of {target} ({expected * 1000:F0} ms) by '{method}'{(method == "normal" ? $" x{repeats} burst" : "")}" +
+             $"{(restart ? ", stream restart before each" : "")}");
+        int ok = 0, withInvalid = 0, notAtBase = 0, withLaterInvalid = 0, stickyBefore = 0;
+        for (int i = 1; i <= n; i++)
+        {
+            if (restart) e.RestartStream();
+            // baseline: 3 intervals at the 30 fps default
+            var b = new List<double>();
+            long cur = e.Frames.Count;
+            while (b.Count < 3)
+            {
+                var f = e.Frames.WaitFrom(cur, TimeSpan.FromSeconds(10), CancellationToken.None);
+                if (f == null) break;
+                cur = f.Index + 1;
+                if (f.HasPrev) b.Add(f.HostDt);
+            }
+            bool atBase = b.Count == 3 && b.Average() < basePeriod * 1.5;
+            var lastBase = e.Frames.WaitFrom(e.Frames.Count - 1, TimeSpan.FromSeconds(1), CancellationToken.None);
+            if (lastBase != null && lastBase.Data.Length < 2048)
+            {
+                stickyBefore++;
+                Note($"trial {i}: stream delivers 8-byte frames before the write, restarting it");
+                e.RestartStream();
+                Thread.Sleep(300);
+            }
+            if (!atBase) notAtBase++;
+            var sw = Stopwatch.StartNew();
+            int tries = 0;
+            if (method == "standby") StandbyApply(e, target, basePeriod, out tries);
+            else if (method == "standbyfast")
+                // STANDBY, write at once, release: no wait for the frames to stop
+                e.OnDevice((d, x) =>
+                {
+                    x.SensorWrite(S.SensorSlave, 0x3000, 1);
+                    target.Write(x, S.SensorSlave, true, out _);
+                    x.SensorWrite(S.SensorSlave, 0x3000, 0);
+                    return 0;
+                });
+            else
+            {
+                e.OnDevice((d, x) => { for (int k = 0; k < repeats; k++) target.Write(x, S.SensorSlave, true, out _); return 0; });
+                if (method == "normaltoggle")   // the 0.5 engine: write, then the STANDBY restart
+                    e.OnDevice((d, x) => { x.SensorWrite(S.SensorSlave, 0x3000, 1); x.SensorWrite(S.SensorSlave, 0x3000, 0); return 0; });
+            }
+            double writeMs = sw.Elapsed.TotalMilliseconds;
+            // judge: a frame interval at the target within 3 periods + 1 s; count 8-byte (invalid) frames
+            long wcur = e.Frames.Count;
+            var end = Stopwatch.GetTimestamp() + (long)((expected * 3 + 1) * Stopwatch.Frequency);
+            int invalid = 0, frames = 0;
+            double hit = double.NaN;
+            var seen = new List<string>();
+            while (Stopwatch.GetTimestamp() < end && double.IsNaN(hit))
+            {
+                var f = e.Frames.WaitFrom(wcur, TimeSpan.FromSeconds(expected * 3 + 1), CancellationToken.None);
+                if (f == null) break;
+                wcur = f.Index + 1;
+                frames++;
+                if (f.Data.Length < 2048) invalid++;
+                if (f.HasPrev)
+                {
+                    seen.Add($"{f.HostDt * 1000:F0}{(f.Data.Length < 2048 ? "*" : "")}");
+                    if (Math.Abs(f.HostDt - expected) < 0.02 + expected * 0.015) hit = sw.Elapsed.TotalMilliseconds;
+                }
+            }
+            bool good = !double.IsNaN(hit);
+            // the next frames after the hit: still at the target, valid payloads?
+            int laterInvalid = 0;
+            var later = new List<string>();
+            for (int k = 0; good && k < Int("later", 3); k++)
+            {
+                var f = e.Frames.WaitFrom(wcur, TimeSpan.FromSeconds(expected * 2 + 1), CancellationToken.None);
+                if (f == null) break;
+                wcur = f.Index + 1;
+                if (f.Data.Length < 2048) laterInvalid++;
+                later.Add($"{f.HostDt * 1000:F0}{(f.Data.Length < 2048 ? "*" : "")}");
+            }
+            if (laterInvalid > 0) withLaterInvalid++;
+            if (good) ok++;
+            if (invalid > 0) withInvalid++;
+            Note($"trial {i}: base {(atBase ? "ok" : "NOT at base")} ({(b.Count > 0 ? b.Average() * 1000 : 0):F0} ms), write {writeMs:F0} ms" +
+                 $"{(method == "standby" ? $" ({tries} STANDBY tries)" : "")}, {(good ? $"TOOK ({hit:F0} ms)" : "did not take")}, " +
+                 $"{invalid} invalid; intervals {string.Join(" ", seen)} | then {string.Join(" ", later)}");
+            // back to the 30 fps default through STANDBY (reliable), verified by the interval
+            for (int k = 0; k < 5; k++)
+            {
+                StandbyApply(e, baseT, expected, out _);
+                var f1 = e.Frames.WaitFrom(e.Frames.Count, TimeSpan.FromSeconds(2), CancellationToken.None);
+                var f2 = f1 == null ? null : e.Frames.WaitFrom(f1.Index + 1, TimeSpan.FromSeconds(2), CancellationToken.None);
+                if (f2 != null && f2.HostDt < basePeriod * 1.5) break;
+                Note("reset to the default timing did not take, again");
+            }
+        }
+        Note($"RESULT '{method}'{(method == "normal" ? $" x{repeats}" : "")}{(restart ? " restart" : "")}: took {ok}/{n}, " +
+             $"trials with invalid frames {withInvalid}/{n} (still invalid in the next frames: {withLaterInvalid}), 8-byte stream before the write {stickyBefore}, not at base before {notAtBase}");
         return 0;
     }
 
