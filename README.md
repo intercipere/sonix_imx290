@@ -92,8 +92,8 @@ The driver writes only volatile sensor and bridge registers, which reset when th
 
 ## Testing and reporting
 
-Please open an [issue](../../issues/new/choose) with the *Test report* template, even when everything works.
-Most useful:
+Please open an [issue](../../issues/new), even when everything works. Name your camera (Hardware Ids from Device
+Manager), Windows and ASCOM Platform version and the driver version. Most useful:
 
 1. The result of the quick check, run in a command prompt in `C:\Program Files\Sonix290Camera`:
 
