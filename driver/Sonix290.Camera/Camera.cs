@@ -106,7 +106,32 @@ namespace Sonix290
                         state = StateIdle;
                     }
                 }
+                WarnSlowPort();
             }
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int MessageBox(IntPtr hWnd, string text, string caption, uint type);
+        const uint MbIconWarning = 0x30, MbTaskModal = 0x2000, MbSetForeground = 0x10000, MbTopmost = 0x40000;
+
+        /// <summary>
+        /// Slow USB port mode works, but the image can be grainier (GitHub issue #1) and it is not meant for guiding:
+        /// tell the user once per connection of the process, blocking until confirmed (WarnSlowPort = false turns it off).
+        /// </summary>
+        void WarnSlowPort()
+        {
+            var eng = engine;
+            if (eng == null || !eng.SlowPort || !settings.WarnSlowPort || eng.SlowPortWarned) return;
+            eng.SlowPortWarned = true;
+            Log.Write("showing the slow USB port warning");
+            MessageBox(IntPtr.Zero,
+                $"The camera is connected to a slow USB port (camera register access {eng.XuReadMs:F0} ms instead of " +
+                "about 2 ms; seen on chipset USB ports).\n\n" +
+                "The driver works around it (15 fps mode, frames at least 0.25 s long), but the image can be noticeably " +
+                "grainier. This is not recommended for guiding.\n\n" +
+                "Please connect the camera to a USB port on the CPU's USB controller (on desktop PCs usually a rear port) " +
+                "and connect again.",
+                FriendlyName + ": slow USB port", MbIconWarning | MbTaskModal | MbSetForeground | MbTopmost);
         }
 
         public string Description => engine != null && engine.SlowPort

@@ -74,8 +74,8 @@ frame takes about the exposure time.
 > frame at least 0.25 s long (shorter exposures are still exact, but come at most 4 per second). Exposures work,
 > but **the image can look noticeably grainier** in this mode (under investigation, see the issues), so it is
 > **not recommended for guiding**. Use a port on the CPU's USB controller instead (on desktop PCs usually a rear
-> port). You can tell the mode from the camera description (*"slow USB port"*) or the log line `slow USB port
-> mode`.
+> port). In this mode the driver shows a warning box when connecting (click OK to continue; the setting
+> `WarnSlowPort` turns it off), the camera description says *"slow USB port"*, and the log has `slow USB port mode`.
 
 ### Settings
 

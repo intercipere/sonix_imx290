@@ -52,6 +52,8 @@ namespace Sonix290
         public double SlowPortReadMs { get; set; } = 8;
         /// <summary>Shortest frame period in slow USB port mode; shorter exposures use SHS1 inside it.</summary>
         public double SlowPortMinPeriodMs { get; set; } = 250;
+        /// <summary>Show a warning box when connecting in slow USB port mode (off only for automated tests).</summary>
+        public bool WarnSlowPort { get; set; } = true;
         public int MaxApplyAttempts { get; set; } = 3;
         /// <summary>UVC exposure set once at connect, DirectShow log2 seconds (-5 = 31 ms).</summary>
         public int UvcExposureLog2 { get; set; } = -5;

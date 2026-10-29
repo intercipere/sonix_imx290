@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2
+
+- Connecting in slow USB port mode shows a warning box (the client waits until OK is clicked): PHD2 does not
+  display the camera description, so the 0.6.1 warning was not visible there. Setting `WarnSlowPort` (default
+  on) turns the box off, e.g. for automated tests.
+
 ## 0.6.1
 
 - **Slow USB ports work, with a warning.** On some USB controllers (AMD 500-series chipset ports) every

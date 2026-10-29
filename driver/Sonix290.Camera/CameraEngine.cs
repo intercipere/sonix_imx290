@@ -49,6 +49,8 @@ namespace Sonix290
         public bool SlowPort { get; private set; }
         /// <summary>Mean ASIC read time measured at connect (ms).</summary>
         public double XuReadMs { get; private set; }
+        /// <summary>The slow port warning was shown for this connection (the engine is shared by driver instances).</summary>
+        internal bool SlowPortWarned;
         /// <summary>VMAX below which SHS1 sets the exposure; in slow port mode the frame never gets shorter than the floor.</summary>
         public int BaseVmax => SlowPort
             ? Math.Max(Settings.BaseVmax, (int)Math.Round(Settings.SlowPortMinPeriodMs / 1000 / LineSec))
