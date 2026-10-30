@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- SxFlash (experimental): patches ONE sector (0x10000-0x10FFF) of the camera's SPI flash. Uses a frozen copy of
+       the driver's camera access in Driver\ (driver 0.6.3: Native, SonixXu, Support, UvcDevice), so driver changes
+       cannot change the flash tool's behaviour without a deliberate update of that copy. -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>SxFlash</AssemblyName>
+    <Version>0.1.0</Version>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <RootNamespace>Sonix290</RootNamespace>
+    <EnableSourceLink>false</EnableSourceLink>
+    <EnableSourceControlManagerQueries>false</EnableSourceControlManagerQueries>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=src</PathMap>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+  </ItemGroup>
+</Project>
