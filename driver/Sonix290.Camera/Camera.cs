@@ -264,7 +264,9 @@ namespace Sonix290
             {
                 RequireConnected("Gain"); RequireGain();
                 if (value < engine.GainMin || value > engine.GainMax) throw Invalid($"Gain must be {engine.GainMin}..{engine.GainMax}");
-                if (state == StateExposing) throw InvalidOp("cannot change gain during an exposure");
+                // The sensor gain only goes out with the next exposure's timing write, so a change during an exposure
+                // is fine (SharpCap's live view is always exposing). The UVC gain would hit the running frame.
+                if (state == StateExposing && !settings.SensorGain) throw InvalidOp("cannot change gain during an exposure");
                 engine.Gain = value;
             }
         }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.5
+
+- **Gain can be changed during an exposure** (SharpCap's live view, which is always exposing, showed "An error
+  occurred when trying to change the value of Gain"). The new gain is written with the next exposure.
+
 ## 0.7.4
 
 - **Gain is now the sensor's own gain**, in 0.3 dB steps, written to the sensor together with the exposure timing
