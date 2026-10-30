@@ -3,7 +3,7 @@
     <TargetFramework>net48</TargetFramework>
     <OutputType>Exe</OutputType>
     <AssemblyName>SxTest</AssemblyName>
-    <Version>0.6.3</Version>
+    <Version>0.7.4</Version>
     <Deterministic>true</Deterministic>
     <PathMap>$(MSBuildProjectDirectory)=/src/$(MSBuildProjectName)</PathMap>
     <!-- the SDK's SourceLink would embed the local repo path in the PDB -->

@@ -187,6 +187,54 @@ namespace Sonix290
             return d;
         }
 
+        /// <summary>
+        /// Formats of the first matching camera's capture pin (no graph, nothing started); empty when no such camera
+        /// is present. Usable on any COM thread, also while another instance streams.
+        /// </summary>
+        public static List<(Guid sub, int width, int height)> ListModes(string match)
+        {
+            var r = new List<(Guid, int, int)>();
+            IMoniker found = null;
+            foreach (var (e, m) in Monikers())
+            {
+                if (found == null && e.Path.IndexOf(match, StringComparison.OrdinalIgnoreCase) >= 0) found = m;
+                else Ole.Release(m);
+            }
+            if (found == null) return r;
+            var d = new UvcDevice();
+            try
+            {
+                Ole.CreateBindCtx(0, out var ctx);
+                var iid = typeof(IBaseFilter).GUID;
+                found.BindToObject(ctx, null, ref iid, out object src);
+                Ole.Release(ctx);
+                d.source = (IBaseFilter)src;
+                foreach (var (pin, name) in d.OutputPins())
+                {
+                    bool still = name.IndexOf("still", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!still && pin is IAMStreamConfig sc && sc.GetNumberOfCapabilities(out int n, out int size) == 0)
+                    {
+                        IntPtr caps = Marshal.AllocCoTaskMem(Math.Max(size, 256));
+                        for (int i = 0; i < n; i++)
+                            if (sc.GetStreamCaps(i, out IntPtr pmt, caps) == 0)
+                            {
+                                if (FormatOf(pmt, out var sub, out int w, out int h, out _) && !r.Contains((sub, w, h)))
+                                    r.Add((sub, w, h));
+                                Ole.FreeMediaType(pmt);
+                            }
+                        Marshal.FreeCoTaskMem(caps);
+                    }
+                    Ole.Release(pin);
+                }
+            }
+            finally
+            {
+                Ole.Release(found);
+                d.Dispose();
+            }
+            return r;
+        }
+
         void Build(IMoniker moniker, int width, int height, Guid subType, double intervalMs, ISampleGrabberCB sink)
         {
             Ole.CreateBindCtx(0, out var ctx);
@@ -235,6 +283,11 @@ namespace Sonix290
                 nullIn = Pin(nullFilter, 0);
                 Check(graph.ConnectDirect(pin, grabIn, pmt), "connect camera->grabber");
                 Check(graph.ConnectDirect(grabOut, nullIn, IntPtr.Zero), "connect grabber->null");
+                // No reference clock: usbvideo stamps samples at +listed interval, and with a clock the null renderer
+                // waits for each stamp, blocking the capture thread. A mode whose listed interval is longer than the
+                // real frame period (1080p YUY2 lists 1 fps on S1) was paced to 1 s and lost frames (2026-10-30).
+                int hr = ((IMediaFilter)graph).SetSyncSource(IntPtr.Zero);
+                Log.Write($"graph sync source none: hr=0x{hr:X8}");
             }
             finally
             {

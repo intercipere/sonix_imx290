@@ -42,11 +42,17 @@ namespace Sonix290
         public bool IsOpen => dev != null;
         public string DeviceName => dev?.Name;
         public FrameBuffer Frames => frames;
-        /// <summary>1H. The firmware doubles it at 15 fps instead of VMAX (measured 58.18 us; VMAX 17191 -> 1000.1 ms).</summary>
-        public double LineSec => Settings.LineTimeUs * 1e-6 * LineFactor;
+        /// <summary>1H. The firmware doubles it at 15 fps instead of VMAX (measured 58.18 us; VMAX 17191 -> 1000.1 ms).
+        /// In the uncompressed 1080p mode it follows the HMAX the engine writes.</summary>
+        public double LineSec => HdYuy2 ? Settings.HdYuy2Hmax * Settings.HdYuy2NsPerHmax * 1e-9 : Settings.LineTimeUs * 1e-6 * LineFactor;
+        /// <summary>Uncompressed 1920x1080 (cameras whose firmware lists it): needs HMAX written at every stream start.</summary>
+        bool HdYuy2 => dev != null && dev.SubType == MediaGuids.Yuy2 && dev.Width >= 1920;
         double LineFactor => dev != null && dev.Fps > 0 && dev.Fps < 20 ? 2 : 1;
         /// <summary>Slow USB port mode (see Settings.SlowPortReadMs).</summary>
         public bool SlowPort { get; private set; }
+        /// <summary>Slow port mode with MJPEG at 15 fps, where the image can be grainier (GitHub issue #1: the JPEG
+        /// encoder settles at other quality levels). Uncompressed modes keep their frame rate and have no encoder.</summary>
+        public bool SlowPortMjpeg => SlowPort && dev != null && dev.SubType == MediaGuids.Mjpg && dev.Fps < 20;
         /// <summary>Mean ASIC read time measured at connect (ms).</summary>
         public double XuReadMs { get; private set; }
         /// <summary>The slow port warning was shown for this connection (the engine is shared by driver instances).</summary>
@@ -93,6 +99,8 @@ namespace Sonix290
         [System.Runtime.InteropServices.DllImport("winmm.dll")] static extern int timeBeginPeriod(int ms);
         [System.Runtime.InteropServices.DllImport("winmm.dll")] static extern int timeEndPeriod(int ms);
         bool timerRaised, wroteTiming, usedStandby;
+        /// <summary>VMAX of the last timing write (uncompressed 1080p: an SHS1-only change is written without STANDBY).</summary>
+        int lastVmax = -1;
         /// <summary>Slow port mode: the sensor has left the short default frames (bootstrap through STANDBY done).</summary>
         bool escaped;
 
@@ -102,7 +110,8 @@ namespace Sonix290
             Log.Write("open: " + Settings);
             // Default Windows timer resolution (15.6 ms) would stretch the I2C polling sleeps 3-4x.
             if (!timerRaised) timerRaised = timeBeginPeriod(1) == 0;
-            var sub = Settings.Format.Equals("YUY2", StringComparison.OrdinalIgnoreCase) ? MediaGuids.Yuy2 : MediaGuids.Mjpg;
+            sensorGain = Settings.ConnectGain;   // clamped to the range in ConfigureControls
+            var sub =Settings.Format.Equals("YUY2", StringComparison.OrdinalIgnoreCase) ? MediaGuids.Yuy2 : MediaGuids.Mjpg;
             StartDevice(sub, Settings.FrameIntervalMs);
             com.Run(() =>
             {
@@ -113,8 +122,7 @@ namespace Sonix290
             });
             SlowPort = XuReadMs > Settings.SlowPortReadMs;
             Log.Write($"ASIC read {XuReadMs:F1} ms (slow port threshold {Settings.SlowPortReadMs} ms)" +
-                      (SlowPort ? ": slow USB port mode. WARNING: the image may be grainier on this port (15 fps " +
-                                  "mode); for guiding use a port on the CPU's USB controller" : ""));
+                      (SlowPort ? ": slow USB port mode" : ""));
             if (SlowPort && Settings.FrameIntervalMs <= 0 && sub == MediaGuids.Mjpg)
             {
                 // 15 fps doubles the time between the firmware's I2C jobs, which the STANDBY bootstrap needs
@@ -123,6 +131,9 @@ namespace Sonix290
                 frames.BreakChain();
                 StartDevice(sub, 66.6667);
             }
+            if (SlowPortMjpeg)
+                Log.Write("WARNING: MJPEG at 15 fps on a slow USB port, the image may be grainier; for guiding use a port " +
+                          "on the CPU's USB controller");
             applied = null;
             escaped = false;
         }
@@ -136,16 +147,37 @@ namespace Sonix290
                 Log.Write($"device '{dev.Name}' {MediaGuids.Name(dev.SubType)} {dev.Width}x{dev.Height} {dev.Fps:F1} fps, {dev.Path}");
                 ConfigureControls();
                 dev.Start();
+                // uncompressed 1080p delivers no frame at the firmware's line length: HMAX before the first frame
+                if (HdYuy2)
+                {
+                    xu = SonixXu.Find(dev.KsControl, dev.Topology);
+                    WriteHdHmax();
+                }
             });
             // A frame length left from an earlier session can make the first frame take up to 7.6 s.
-            if (frames.WaitFrom(first, TimeSpan.FromSeconds(20), CancellationToken.None) == null)
+            // Uncompressed 1080p: the HMAX write can get lost on a slow port (connect 1 of 3 on the chipset port,
+            // 2026-10-30), and without it no frame ever comes, so it is written again every 5 s.
+            int tries = HdYuy2 ? 4 : 1;
+            var wait = TimeSpan.FromSeconds(HdYuy2 ? 5 : 20);
+            bool got = false;
+            for (int i = 0; i < tries && !got; i++)
             {
-                throw new InvalidOperationException(
-                    "Camera delivers no frames (in use by another program, or camera access for desktop apps off in Windows privacy settings?)");
+                if (i > 0)
+                {
+                    Log.Write($"no frame {wait.TotalSeconds:F0} s after the HMAX write, writing it again");
+                    com.Run(WriteHdHmax);
+                }
+                got = frames.WaitFrom(first, wait, CancellationToken.None) != null;
+            }
+            if (!got)
+            {
+                throw new InvalidOperationException(HdYuy2
+                    ? "Camera delivers no frames in uncompressed 1920x1080 (HMAX write failed, or the line length is too short: raise HdYuy2Hmax)"
+                    : "Camera delivers no frames (in use by another program, or camera access for desktop apps off in Windows privacy settings?)");
             }
             com.Run(() =>
             {
-                xu = SonixXu.Find(dev.KsControl, dev.Topology);
+                if (xu == null) xu = SonixXu.Find(dev.KsControl, dev.Topology);
                 Log.Write($"ASIC chip id (0x101F) = 0x{xu.AsicRead(0x101F):X2}");
                 bool ack = xu.Probe(Settings.SensorSlave);
                 Log.Write($"sensor slave 0x{Settings.SensorSlave:X2} ack: {ack}");
@@ -178,7 +210,16 @@ namespace Sonix290
                     Freeze(pa, prop, name, null);
                 if (Settings.BacklightOff) Freeze(pa, 8, "backlight compensation", 0);
                 if (Settings.FreezeWhiteBalance) Freeze(pa, 7, "white balance", null);
-                if (pa.GetRange(9, out int gmin, out int gmax, out _, out int gdef, out _) == 0)
+                if (Settings.SensorGain)
+                {
+                    GainMin = 0;
+                    GainMax = Math.Max(0, Math.Min(Settings.SensorGainMax, SensorTiming.GainLimit + Math.Max(0, Settings.HcgFromGain)));
+                    HasGain = true;
+                    sensorGain = Math.Max(0, Math.Min(sensorGain, GainMax));
+                    Log.Write($"gain: sensor gain 0..{GainMax} (0.3 dB steps, HCG from {Settings.HcgFromGain}), now {sensorGain}");
+                    if (pa.GetRange(9, out _, out _, out _, out _, out _) == 0) Freeze(pa, 9, "UVC gain (held at 0)", 0);
+                }
+                else if (pa.GetRange(9, out int gmin, out int gmax, out _, out int gdef, out _) == 0)
                 {
                     GainMin = gmin; GainMax = gmax; HasGain = true;
                     pa.Get(9, out int g, out int f);
@@ -217,18 +258,43 @@ namespace Sonix290
             finally { System.Runtime.InteropServices.Marshal.FreeCoTaskMem(buf); }
         }
 
+        /// <summary>ASCOM Gain with Settings.SensorGain (0.3 dB steps); written with the next exposure's timing.</summary>
+        int sensorGain;
+
         public int Gain
         {
-            get => com.Run(() => { dev.ProcAmp.Get(9, out int g, out _); return g; });
+            get => Settings.SensorGain ? sensorGain : com.Run(() => { dev.ProcAmp.Get(9, out int g, out _); return g; });
             set
             {
                 // N.I.N.A. sets the gain before every exposure; only touch the camera on a real change.
                 // Measured: a gain change keeps VMAX, and every frame's interval is checked anyway.
                 int old = Gain;
                 if (old == value) return;
-                com.Run(() => dev.ProcAmp.Set(9, value, 2));
+                if (Settings.SensorGain) sensorGain = value;
+                else com.Run(() => dev.ProcAmp.Set(9, value, 2));
                 Log.Write($"gain {old} -> {value}");
             }
+        }
+
+        /// <summary>Adds the sensor gain registers for an ASCOM gain to a timing (SensorGain only).</summary>
+        SensorTiming WithGain(SensorTiming t, int gain)
+        {
+            if (!Settings.SensorGain) return t;
+            t.Hcg = Settings.HcgFromGain >= 0 && gain >= Settings.HcgFromGain;
+            t.Gain = Math.Min(SensorTiming.GainLimit, t.Hcg ? gain - Settings.HcgFromGain : gain);
+            return t;
+        }
+
+        /// <summary>After a stream start the sensor may hold the firmware's gain again: rewrite ours (COM thread).</summary>
+        void RewriteGain()
+        {
+            if (!Settings.SensorGain || !applied.HasValue) return;
+            var g = applied.Value;
+            bool ok = xu.SensorWrite(Settings.SensorSlave, 0x3001, 1)
+                    & xu.SensorWrite(Settings.SensorSlave, 0x3014, (byte)g.Gain.Value)
+                    & xu.SensorWrite(Settings.SensorSlave, 0x3009, SensorTiming.Reg3009(g.Hcg))
+                    & xu.SensorWrite(Settings.SensorSlave, 0x3001, 0);
+            Log.Write($"gain rewritten after the stream start (GAIN={g.Gain}{(g.Hcg ? " HCG" : "")}): {(ok ? "ok" : "I2C failed")}");
         }
 
         /// <summary>Writes VMAX/SHS1 Settings.WriteRepeats times (a single write does not always take effect).</summary>
@@ -321,6 +387,55 @@ namespace Sonix290
             return release;
         }
 
+        /// <summary>
+        /// Uncompressed 1080p: HMAX in a STANDBY toggle (the firmware leaves the I2C master alone in STANDBY), repeated
+        /// until all writes report done (at most 3 tries). Call on the COM thread right after every stream start.
+        /// </summary>
+        void WriteHdHmax()
+        {
+            int h = Settings.HdYuy2Hmax, ok = 0;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < 3 && ok < 5; i++)
+            {
+                ok = (xu.SensorWrite(Settings.SensorSlave, StandbyReg, 1) ? 1 : 0)
+                   + (xu.SensorWrite(Settings.SensorSlave, 0x3001, 1) ? 1 : 0)
+                   + (xu.SensorWrite(Settings.SensorSlave, 0x301C, (byte)h, (byte)(h >> 8)) ? 1 : 0)
+                   + (xu.SensorWrite(Settings.SensorSlave, 0x3001, 0) ? 1 : 0)
+                   + (xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0) ? 1 : 0);
+            }
+            usedStandby = true;
+            // The firmware's per-frame sensor job rewrites SHS1 from the UVC exposure in this mode (measured: SHS1 8 and
+            // 1000 gave reversed brightness). RAM 0x0A54 = 1 makes the job return at once (from the firmware analysis;
+            // measured 2026-10-29: SHS1 then sticks, 40 ms vs 358 ms). UVC exposure/gain then no longer reach the sensor.
+            xu.AsicWrite(0x0A54, 1);
+            byte job = xu.AsicRead(0x0A54);
+            lastVmax = -1;   // the stream start re-ran the sensor init
+            Log.Write($"uncompressed 1080p: HMAX 0x{h:X4} written ({ok}/5 I2C ok, {sw.ElapsedMilliseconds} ms), 1H {LineSec * 1e6:F1} us; " +
+                      $"firmware sensor job off (0x0A54 = {job:X2}); {WriteHdInputWindow()}");
+        }
+
+        /// <summary>
+        /// Input window height (HdYuy2InputLines): 0x118A bits 5:4 and 0x118B hold lines / 2 (stock 0x21C = 1080).
+        /// The output size (0x1125, 0x111D) is not touched, so frames stay 1920x1080.
+        /// </summary>
+        string WriteHdInputWindow()
+        {
+            int lines = Settings.HdYuy2InputLines;
+            if (lines <= 0) return "input window left at the firmware's";
+            int half = lines / 2;
+            byte hi = xu.AsicRead(0x118A), lo = xu.AsicRead(0x118B);
+            xu.AsicWrite(0x118A, (byte)((hi & 0xCF) | ((half >> 8) & 3) << 4));
+            xu.AsicWrite(0x118B, (byte)half);
+            int now = ((xu.AsicRead(0x118A) >> 4) & 3) << 8 | xu.AsicRead(0x118B);
+            return $"input window {(((hi >> 4) & 3) << 8 | lo) * 2} -> {now * 2} lines{(now == half ? "" : " (DID NOT TAKE)")}";
+        }
+
+        int HdLines => Settings.HdYuy2InputLines > 0 ? Settings.HdYuy2InputLines : 1080;
+
+        /// <summary>Uncompressed 1080p: a frame arrives one period plus about the readout of the input lines after a
+        /// STANDBY release (measured +363..378 ms at 1H 321 us); the frame cut by the release is not delivered.</summary>
+        double HdFirstFrameLatency => HdLines * LineSec + 0.03;
+
         /// <summary>Makes sure the sensor is not left in STANDBY (the release write may not have landed).</summary>
         void ReleaseStandby() => com.Run(() => xu.SensorWrite(Settings.SensorSlave, StandbyReg, 0));
 
@@ -407,7 +522,7 @@ namespace Sonix290
             lock (exposeGate)
             {
                 if (dev == null) throw new InvalidOperationException("not connected");
-                var t = SensorTiming.For(seconds, LineSec, BaseVmax);
+                var t = WithGain(SensorTiming.For(seconds, LineSec, BaseVmax), sensorGain);
                 double expected = t.Period(LineSec);
                 var r = new ExposureResult { Requested = seconds, Timing = t, ExpectedPeriod = expected };
                 long t0 = Stopwatch.GetTimestamp();
@@ -415,13 +530,13 @@ namespace Sonix290
                 bool confirmed = applied.HasValue && applied.Value.Equals(t);
                 long notBefore = t0 - (long)(expected * Settings.AcceptEarlyStartPct / 100 * Stopwatch.Frequency);
                 int need = 1, skipFirst = 0, windowN = 0, badInRow = 0, invalidInRow = 0, streamRestarts = 0;
-                long windowStart = 0, flushUntil = 0;
+                long windowStart = 0, flushUntil = 0, releaseAt = 0;
                 bool standby = Settings.StandbyRestart && expected >= StandbyMinSec;
 
                 void Restart()
                 {
                     long release = RestartFrame();
-                    notBefore = release;
+                    notBefore = releaseAt = release;
                     flushUntil = release + (long)(StandbyFlushSec * Stopwatch.Frequency);
                     cursor = frames.Count;
                 }
@@ -437,7 +552,12 @@ namespace Sonix290
                     // Slow port: the first write and every rewrite go through STANDBY (a failed write may have left
                     // the short default frames, where normal writes lose).
                     bool boot = SlowPort && (!escaped || r.Applies > 0);
-                    long release = boot ? Bootstrap(t, ct) : Settings.StandbyWrites ? StandbyWrite(t) : 0;
+                    // Uncompressed 1080p: after a STANDBY release at the base frame length the stream needs 1-2 s to
+                    // resume (2026-10-29), so a change of SHS1 alone (same VMAX) is written plainly; with the firmware's
+                    // sensor job off nothing overwrites it. A first write or rewrite still goes through STANDBY.
+                    bool plainHd = HdYuy2 && r.Applies == 0 && lastVmax == t.Vmax;
+                    long release = boot ? Bootstrap(t, ct) : Settings.StandbyWrites && !plainHd ? StandbyWrite(t) : 0;
+                    lastVmax = t.Vmax;
                     if (release == 0) WriteTiming(t);
                     r.Applies++;
                     confirmed = false;
@@ -447,12 +567,15 @@ namespace Sonix290
                     // Arrival lags the sensor's frame boundary by about a frame; for short periods skipping one
                     // more frame is cheap and keeps a frame that began before the write out of the window.
                     skipFirst = expected < VerifyWindowSec ? 1 : 0;
+                    // uncompressed 1080p arrives ~one base frame (the readout) after its end: after a plain write the
+                    // first frame to arrive started before it (measured: the brightness lagged by one request)
+                    if (HdYuy2 && release == 0) skipFirst = 1;
                     windowN = 0;
                     badInRow = 0;
                     if (release != 0)
                     {
                         // the release restarted the frame like a STANDBY restart
-                        notBefore = release;
+                        notBefore = releaseAt = release;
                         flushUntil = release + (long)(StandbyFlushSec * Stopwatch.Frequency);
                     }
                     else if (standby) Restart();
@@ -464,7 +587,9 @@ namespace Sonix290
                 while (true)
                 {
                     ct.ThrowIfCancellationRequested();
-                    var wait = TimeSpan.FromSeconds(Math.Max(expected, 0.1) * 2.5 + 3);
+                    // uncompressed 1080p: single frames get lost (~1 in 4-6), and a rewrite (STANDBY) costs more of them,
+                    // so a missing frame is waited for two periods plus the readout before the write counts as failed
+                    var wait = TimeSpan.FromSeconds(HdYuy2 ? 2 * expected + HdFirstFrameLatency + 3 : Math.Max(expected, 0.1) * 2.5 + 3);
                     var f = frames.WaitFrom(cursor, wait, ct);
                     if (f == null)
                     {
@@ -477,6 +602,32 @@ namespace Sonix290
                     if (f.Ticks < flushUntil)
                     {
                         r.FramesSkipped++;   // the frame cut by the STANDBY restart
+                        continue;
+                    }
+                    // Uncompressed 1080p: the frame cut by the release never arrives, so the first frame after it has no
+                    // interval of its own; judge it by its arrival after the release (one period plus the readout).
+                    if (HdYuy2 && releaseAt != 0 && f.PrevTicks < releaseAt && ValidPayload(f))
+                    {
+                        long rel = releaseAt;
+                        releaseAt = 0;
+                        // frames get lost now and then in this mode (~1 in 4-6, any length): the k-th period after the
+                        // release is a complete exposure of the right length as well
+                        double since = Sec(f.Ticks - rel), after = since - HdFirstFrameLatency;
+                        int k = Math.Max(1, (int)Math.Round(after / expected));
+                        double period = after / k;
+                        bool ok = k <= 3 && Math.Abs(period - expected) <= Tolerance(expected, 1) + 0.03 / k;
+                        Log.Write($"frame {f.Index}: {since * 1000:F0} ms after the release = {k} period(s) of {period * 1000:F1} ms + readout, " +
+                                  $"expected {expected * 1000:F1} ms -> {(ok ? "ok" : "WRONG")}");
+                        if (ok)
+                        {
+                            applied = t;
+                            r.Frame = f;
+                            r.MeasuredPeriod = period;
+                            r.StartUtc = DateTime.UtcNow - TimeSpan.FromSeconds(Sec(Stopwatch.GetTimestamp() - rel));
+                            r.TotalSeconds = Sec(Stopwatch.GetTimestamp() - t0);
+                            return r;
+                        }
+                        r.FramesSkipped++;   // later frames are judged by their intervals as usual
                         continue;
                     }
                     if (!f.HasPrev || f.PrevTicks < notBefore)
@@ -496,7 +647,14 @@ namespace Sonix290
                                     $"camera delivers invalid frames ({f.Data.Length} bytes) after {streamRestarts} stream restarts");
                             streamRestarts++;
                             var sw = Stopwatch.StartNew();
-                            com.Run(() => { dev.Stop(); frames.BreakChain(); dev.Start(); });
+                            com.Run(() =>
+                            {
+                                dev.Stop();
+                                frames.BreakChain();
+                                dev.Start();
+                                if (HdYuy2) WriteHdHmax();
+                                RewriteGain();
+                            });
                             Log.Write($"restarted the stream after {invalidInRow} invalid frames ({sw.ElapsedMilliseconds} ms)");
                             invalidInRow = 0;
                             // VMAX survives Stop/Run; the frame after Run started before it, so wait for a fresh one.
@@ -561,6 +719,8 @@ namespace Sonix290
             if (pause) dev.Pause(); else dev.Stop();
             frames.BreakChain();
             dev.Start();
+            if (HdYuy2) WriteHdHmax();
+            RewriteGain();
         });
 
         internal int SetKsControl(int id, int value) => com.Run(() => SetKsCameraControl(id, value));
@@ -582,7 +742,8 @@ namespace Sonix290
                 {
                     try
                     {
-                        var b = new SensorTiming { Vmax = Settings.BaseVmax, Shs1 = SensorTiming.LongShs1 };
+                        // ... and at 0 dB, conversion gain low (SensorGain), as after a replug
+                        var b = WithGain(new SensorTiming { Vmax = Settings.BaseVmax, Shs1 = SensorTiming.LongShs1 }, 0);
                         if (Settings.StandbyWrites) StandbyWrite(b);
                         else
                         {

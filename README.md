@@ -24,7 +24,7 @@ with this one.
 - Monochrome 1920×1080, 8 bit (`MaxADU` 255), optional 2×2 binning and subframes; colour (RGB) as an option.
 - Exposure 0.0001 – 7.62 s. Above 33 ms the exposure is set by the sensor's frame length; below it by the
   electronic shutter.
-- Gain 0–100 (the camera's UVC gain).
+- Gain 0–100 = sensor gain 6–36 dB in 0.3 dB steps (high conversion gain, all analog); for faint targets 40–90.
 - From 0.5 s on, every exposure starts when the client asks for it, so looping clients run at about
   exposure + 0.1 s (plus the client's own overhead; PHD2 at 1 s: ~1.4 s per frame).
 
@@ -72,16 +72,26 @@ frame takes about the exposure time.
 > 30 fps. The driver detects this at connect and switches to a *slow USB port mode*: it streams at 15 fps, gets
 > the first timing through a retried STANDBY (the first exposure takes a few seconds longer), and keeps every
 > frame at least 0.25 s long (shorter exposures are still exact, but come at most 4 per second). Exposures work,
-> but **the image can look noticeably grainier** in this mode (under investigation, see the issues), so it is
-> **not recommended for guiding**. Use a port on the CPU's USB controller instead (on desktop PCs usually a rear
-> port). In this mode the driver shows a warning box when connecting (click OK to continue; the setting
-> `WarnSlowPort` turns it off), the camera description says *"slow USB port"*, and the log has `slow USB port mode`.
+> but in MJPEG **the image can look noticeably grainier** in this mode (under investigation, see the issues), so it
+> is **not recommended for guiding**. Use a port on the CPU's USB controller instead (on desktop PCs usually a rear
+> port). In MJPEG the driver then shows a warning box when connecting (click OK to continue; the advanced setting
+> `WarnSlowPort` turns it off) and the camera description says *"slow USB port"*. The uncompressed modes keep
+> their frame rate and show no warning. The log has `slow USB port mode` in either case.
 
 ### Settings
 
-The chooser's *Properties* button opens the settings (stored in `HKCU\Software\Sonix290Camera`). The defaults
-are the values measured for this camera; you should not need to change them. *Defaults* restores them, *Open log
-folder* opens the logs. If you installed an earlier test version, click **Defaults** once.
+The chooser's *Properties* button opens the setup dialog. It has one choice, the **video mode**, and lists the
+modes your camera offers:
+
+- **MJPEG 1920x1080** (compressed, the default): every camera of this type; exposures 0.1 ms to 7.6 s.
+- **YUY2 1920x1080** (uncompressed): only cameras with a firmware patch for this mode list it; no JPEG
+  artefacts, exposures up to two minutes, each frame takes at least 0.54 s. The patch is made with the separate,
+  **experimental** flash tool in [flash/](flash/README.md); read its warnings first.
+- **YUY2 640x480** (uncompressed): every camera of this type; lower resolution.
+
+*Open log folder* opens the logs. *Advanced...* shows all other settings (stored in
+`HKCU\Software\Sonix290Camera`); their defaults are the values measured for this camera, and you should not need
+to change them. *Defaults* there restores them. If you installed an earlier test version, click **Defaults** once.
 
 ## How it works
 
@@ -98,7 +108,7 @@ through its I2C master to the sensor's registers. The driver:
    the timing is written again if the camera did not take it.
 
 The driver writes only volatile sensor and bridge registers, which reset when the camera is unplugged.
-**It never writes the camera's flash memory.**
+**It never writes the camera's flash memory.** (The separate tool in [flash/](flash/README.md) does, on request.)
 
 ## Testing and reporting
 

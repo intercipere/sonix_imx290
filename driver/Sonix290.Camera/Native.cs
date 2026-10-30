@@ -114,6 +114,19 @@ namespace Sonix290
         [PreserveSig] int GetState(int timeoutMs, out int state);
     }
 
+    /// <summary>The filter graph manager's IMediaFilter (strmif.h), used for SetSyncSource only.</summary>
+    [ComImport, Guid("56a86899-0ad4-11ce-b03a-0020af0ba770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMediaFilter
+    {
+        [PreserveSig] int GetClassID(out Guid clsid);
+        [PreserveSig] int Stop();
+        [PreserveSig] int Pause();
+        [PreserveSig] int Run(long start);
+        [PreserveSig] int GetState(int timeoutMs, out int state);
+        [PreserveSig] int SetSyncSource(IntPtr clock);
+        [PreserveSig] int GetSyncSource(out IntPtr clock);
+    }
+
     [ComImport, Guid("C6E13340-30AC-11d0-A18C-00A0C9118956"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IAMStreamConfig
     {

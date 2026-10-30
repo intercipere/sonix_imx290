@@ -30,8 +30,9 @@ static class Program
                                N times (waiting c*stagger ms before restart c); logs first frames after each
   standby MS [--cycles N] [--stagger MS] [--hold MS] [--reg R]   set MS, then toggle STANDBY (0x3000, or R)
                                at staggered points of the frame; logs first frames after each release
-  driver MS [--count N] [--save DIR] [--gap MS] [--seq MS,MS,..]   exposures through the driver engine (verification,
-                               retries); --gap waits between exposures like a client
+  driver MS [--count N] [--save DIR] [--gap MS] [--seq MS,MS,..] [--gain G,G,..]   exposures through the driver engine
+                               (verification, retries); --gap waits between exposures like a client; --gain sets the
+                               ASCOM gain before each exposure (cycled)
   com MS [--count N]           exposures through the registered ASCOM driver (ProgID, late binding)
   asic ADDR [N]                read ASIC registers
   sbwrite MS [--tries N] [--repeats R]   write via STANDBY: retry STANDBY=1 until frames stop, write
@@ -408,10 +409,14 @@ Settings: " ;
         Console.WriteLine("# n requested_ms expected_ms measured_ms applies skipped total_s meanY");
         // --gap: client time between exposures (PHD2: ~160-450 ms for download and display)
         int gap = Int("gap", 0);
+        // --gain G,G,..: ASCOM gain before each exposure (cycled like --seq)
+        int[] gains = Opt.TryGetValue("gain", out var gl) ? gl.Split(',').Select(s => int.Parse(s, CultureInfo.InvariantCulture)).ToArray() : null;
+        if (gains != null) Note($"gain range {e.GainMin}..{e.GainMax}");
         for (int i = 0; i < count; i++)
         {
             if (i > 0 && gap > 0) Thread.Sleep(gap);
             ms = seq[i % seq.Length];
+            if (gains != null) e.Gain = gains[i % gains.Length];
             var r = e.Expose(ms / 1000, CancellationToken.None, p => Note(p));
             var pic = e.Decode(r.Frame, false);
             Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0} {1} {2:F1} {3:F1} {4} {5} {6:F2} {7:F2}",

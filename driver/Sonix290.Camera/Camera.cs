@@ -121,7 +121,7 @@ namespace Sonix290
         void WarnSlowPort()
         {
             var eng = engine;
-            if (eng == null || !eng.SlowPort || !settings.WarnSlowPort || eng.SlowPortWarned) return;
+            if (eng == null || !eng.SlowPortMjpeg || !settings.WarnSlowPort || eng.SlowPortWarned) return;
             eng.SlowPortWarned = true;
             Log.Write("showing the slow USB port warning");
             MessageBox(IntPtr.Zero,
@@ -134,7 +134,7 @@ namespace Sonix290
                 FriendlyName + ": slow USB port", MbIconWarning | MbTaskModal | MbSetForeground | MbTopmost);
         }
 
-        public string Description => engine != null && engine.SlowPort
+        public string Description => engine != null && engine.SlowPortMjpeg
             ? FriendlyName + " (slow USB port: image may be grainier, see README)"
             : FriendlyName;
         public string DriverInfo => "Sonix SN9C292B + IMX290/291 UVC camera; long exposures by writing the sensor frame length over the UVC extension unit. Version " + DriverVersion;
@@ -242,7 +242,9 @@ namespace Sonix290
         public bool IsPulseGuiding => throw NotImpl("IsPulseGuiding");
 
         public double ExposureMin => 0.0001;
-        public double ExposureMax => Math.Floor(SensorTiming.MaxExposure(settings.LineTimeUs * 1e-6) * 100) / 100;
+        // the connected mode's 1H (the uncompressed 1080p mode has ~11x longer lines, so a far longer maximum)
+        public double ExposureMax =>
+            Math.Floor(SensorTiming.MaxExposure(engine != null && engine.IsOpen ? engine.LineSec : settings.LineTimeUs * 1e-6) * 100) / 100;
         public double ExposureResolution => 0.0;
 
         public short ReadoutMode
@@ -254,7 +256,7 @@ namespace Sonix290
 
         public double SubExposureDuration { get => throw NotImpl("SubExposureDuration"); set => throw NotImpl("SubExposureDuration"); }
 
-        // Gain: the UVC gain control (numeric mode; Gains is not implemented).
+        // Gain: sensor gain in 0.3 dB steps (Settings.SensorGain), or the UVC gain control (numeric mode; Gains is not implemented).
         public short Gain
         {
             get { RequireConnected("Gain"); RequireGain(); return (short)engine.Gain; }

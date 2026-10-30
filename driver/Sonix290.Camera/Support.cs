@@ -62,6 +62,48 @@ namespace Sonix290
         /// <summary>Show a warning box when connecting in slow USB port mode (off only for automated tests).</summary>
         public bool WarnSlowPort { get; set; } = true;
         public int MaxApplyAttempts { get; set; } = 3;
+        /// <summary>
+        /// Uncompressed 1920x1080 (YUY2 1920x1080 listed by cameras with a modified descriptor/mode table): the
+        /// output path delivers no frame at the firmware's line length, so this HMAX is written right after every
+        /// stream start (the firmware resets it then). Measured 2026-10-29: frames from HMAX ~28000 on; single frames
+        /// get lost at any HMAX (~1 in 4-6 at 2-8 s), at 0x7800 frames of 8 s and more never arrived within 25 s, at
+        /// 0xB500 (1H 484 us, base frame 544 ms) they do.
+        /// </summary>
+        public int HdYuy2Hmax { get; set; } = 0xB500;
+        /// <summary>1H per HMAX unit in that mode in ns (measured 10.45; the 30 fps modes run at 6.25).</summary>
+        public double HdYuy2NsPerHmax { get; set; } = 10.45;
+        /// <summary>
+        /// Uncompressed 1920x1080: sensor lines the bridge reads per frame (its input window, from sensor line 16),
+        /// written after every stream start; the output stays 1080 lines. With the firmware's 1080 the image pipeline
+        /// sends its last 6 lines (23 KB) in one burst after the frame end, and depending on where that falls within
+        /// the USB microframe the bridge cuts up to 2.7 KB, so Windows drops the frame (measured 2026-10-30: ~28 % of
+        /// frames, in bursts every ~5 s). With 1104 input lines the burst is gone (USB trace) and 1 of 301 frames was
+        /// lost. 0 = leave the firmware's window.
+        /// </summary>
+        public int HdYuy2InputLines { get; set; } = 1104;
+        /// <summary>
+        /// ASCOM Gain = sensor gain in 0.3 dB steps, written to the sensor with every timing write (0x3014, and from
+        /// HcgFromGain on high conversion gain with 0x3014 = Gain - HcgFromGain). The UVC gain is then held at 0: it only
+        /// stretches the ISP's 8-bit tone curve, and in uncompressed 1080p it never reaches the sensor (measured
+        /// 2026-10-30: 0x3014 doubles the signal per 6 dB; dark noise below one 8-bit level up to 18 dB, 1.6 at 30 dB).
+        /// Off = ASCOM Gain is the UVC gain (drivers up to 0.7.3).
+        /// </summary>
+        public bool SensorGain { get; set; } = true;
+        /// <summary>Highest ASCOM Gain with SensorGain (0.3 dB steps). 100 = 30 dB analog (+ HCG = 36 dB); above it the
+        /// sensor gain is digital (up to 240 + HcgFromGain). PHD2 sets a share of the range, so a large maximum makes its
+        /// default high.</summary>
+        public int SensorGainMax { get; set; } = 100;
+        /// <summary>
+        /// ASCOM Gain from which HCG is on (0x3009 bit 4; -1 = never; 20 = conversion gain low below 6 dB). Measured
+        /// 2026-10-30: HCG = x1.9 (~6 dB); at the same total gain (24 and 36 dB) about 18 % less dark noise than
+        /// conversion gain low. Default 0: HCG at every gain, Gain 0 = 6 dB.
+        /// </summary>
+        public int HcgFromGain { get; set; } = 0;
+        /// <summary>
+        /// Gain at connect (SensorGain). PHD2's ASCOM camera never sets Gain (HasGainControl is always false), so it runs
+        /// at this value; clients that set Gain (N.I.N.A., SharpCap) override it. 50 = 21 dB with HCG.
+        /// </summary>
+        public int ConnectGain { get; set; } = 50;
         /// <summary>UVC exposure set once at connect, DirectShow log2 seconds (-5 = 31 ms).</summary>
         public int UvcExposureLog2 { get; set; } = -5;
         /// <summary>
@@ -88,11 +130,20 @@ namespace Sonix290
             return s;
         }
 
+        /// <summary>
+        /// Stores only the values that differ from the defaults and removes the others, so a later driver version's
+        /// measured defaults are not overridden by values saved from an older setup dialog.
+        /// </summary>
         public void Save()
         {
+            var d = new Settings();
             using (var k = Registry.CurrentUser.CreateSubKey(KeyPath))
                 foreach (var p in GetType().GetProperties())
-                    k.SetValue(p.Name, Convert.ToString(p.GetValue(this), CultureInfo.InvariantCulture));
+                {
+                    string v = Convert.ToString(p.GetValue(this), CultureInfo.InvariantCulture);
+                    if (v == Convert.ToString(p.GetValue(d), CultureInfo.InvariantCulture)) k.DeleteValue(p.Name, false);
+                    else k.SetValue(p.Name, v);
+                }
         }
 
         /// <summary>Sets a property by name from text; returns false for unknown names or bad values.</summary>

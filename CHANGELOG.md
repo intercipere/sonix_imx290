@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.7.4
+
+- **Gain is now the sensor's own gain**, in 0.3 dB steps, written to the sensor together with the exposure timing
+  and checked the same way. The sensor's high conversion gain is always on (about 6 dB, with less read noise than
+  the same gain without it), so Gain 0..100 = 6..36 dB, all analog. Up to now Gain was the camera's UVC gain,
+  which only stretches the camera's already 8-bit image and, in uncompressed 1920x1080, did not reach the sensor at
+  all. For faint targets use Gain 40-90: at low gain the sensor noise is smaller than one 8-bit step, so dim areas
+  show steps. Settings (Advanced): `SensorGain` (off = the old UVC gain), `SensorGainMax` (up to 240; above 100 the
+  gain is digital), `HcgFromGain` (20 = no HCG below 6 dB, Gain 0 = 0 dB; -1 = never). The UVC gain is held at 0.
+- **Gain at connect** in the setup dialog (default 50 = 21 dB). PHD2 never sets the gain of an ASCOM camera, so it
+  always runs at this value; N.I.N.A. and SharpCap set their own.
+
+## 0.7.3
+
+- **Simpler setup dialog**: only the video mode (the modes this camera offers: MJPEG 1920x1080, YUY2 1920x1080 with the
+  firmware patch, YUY2 640x480) and the log folder. All other settings are under "Advanced...". The dialog now saves
+  only values that differ from the defaults, so values saved by an older version no longer override new defaults.
+- Uncompressed 1920x1080: if no frame arrives within 5 s of connecting, the line length (HMAX) is written again (up
+  to three times). On a slow USB port the first write can get lost (seen once in three connects in PHD2).
+- The slow USB port warning (grainier image, GitHub issue #1) appears only in MJPEG, where the 15 fps workaround
+  applies; the uncompressed modes are not affected.
+- **Uncompressed 1920x1080** for cameras whose firmware offers YUY2 1920x1080 (the stock firmware lists YUY2 only
+  up to 640x480). Select "YUY2 1920x1080" in the setup dialog. In this mode the camera
+  delivers no frame at its default line length, so the driver writes a longer line (HMAX, setting `HdYuy2Hmax`,
+  default 0xB500) right after every stream start and switches off the firmware's own per-frame sensor writes.
+  1H is 484 us (setting `HdYuy2NsPerHmax`), so the shortest frame is 0.54 s and the longest exposure the sensor
+  allows is over two minutes; tested 50 ms to 15 s. YUY2 luma uses the studio range 16-235.
+- In this mode the driver also lets the camera read 1104 sensor lines per frame (output still 1080, setting
+  `HdYuy2InputLines`). With the firmware's 1080 the camera sent the last lines of each frame in one burst and,
+  depending on the USB timing, cut it short, so Windows dropped about a quarter of the frames (in bursts every
+  ~5 s). Measured with the larger window: 1 of 301 frames lost. Should a frame still go missing, the driver waits
+  for the next one instead of rewriting.
+- `ExposureMax` follows the connected mode's line time.
+- The capture graph runs without a reference clock. Windows stamps each frame at the camera's listed frame interval,
+  and with a clock the graph held every frame back to its stamp: a mode that lists a longer interval than the camera
+  really runs at (1080p YUY2 lists 1 fps) delivered at most one frame per second, so exposures with a shorter frame
+  failed verification (SharpCap: "camera did not take the exposure" at 0.3 s).
+
 ## 0.6.3
 
 - **Timing writes are reliable on fast ports too.** The camera firmware's own per-frame sensor write overwrote or

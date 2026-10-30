@@ -168,13 +168,20 @@ namespace Sonix290
         }
     }
 
-    /// <summary>IMX290/291 frame length (VMAX) and shutter (SHS1) for a requested exposure.</summary>
+    /// <summary>IMX290/291 frame length (VMAX) and shutter (SHS1) for a requested exposure, optionally with the gain.</summary>
     public struct SensorTiming : IEquatable<SensorTiming>
     {
         public const int VmaxLimit = 262143;   // 18 bits
         public const int LongShs1 = 8;
+        public const int GainLimit = 240;      // 0x3014: 0.3 dB steps, 0..72 dB
+        /// <summary>0x3009 from the flash's sensor init script; bit 4 selects high conversion gain (HCG).</summary>
+        const byte FrselInit = 0x02, HcgBit = 0x10;
+        internal static byte Reg3009(bool hcg) => (byte)(hcg ? FrselInit | HcgBit : FrselInit);
 
         public int Vmax, Shs1;
+        /// <summary>Sensor gain register 0x3014 and HCG, written with the timing; null = left to the firmware.</summary>
+        public int? Gain;
+        public bool Hcg;
 
         /// <summary>Exposure = (VMAX - SHS1 - 1) x 1H; frame period = VMAX x 1H.</summary>
         public static SensorTiming For(double seconds, double lineSec, int baseVmax)
@@ -192,7 +199,8 @@ namespace Sonix290
         public double Exposure(double lineSec) => (Vmax - Shs1 - 1) * lineSec;
         public double Period(double lineSec) => Vmax * lineSec;
 
-        /// <summary>One REGHOLD-wrapped write of VMAX and SHS1 (LSB first). Returns how many I2C transactions reported success.</summary>
+        /// <summary>One REGHOLD-wrapped write of VMAX and SHS1 (LSB first) and the gain if set. Returns how many I2C
+        /// transactions reported success.</summary>
         internal int Write(SonixXu xu, int slave, bool burst, out int transactions)
         {
             byte[] v = { (byte)Vmax, (byte)(Vmax >> 8), (byte)((Vmax >> 16) & 3) };
@@ -211,13 +219,19 @@ namespace Sonix290
                 for (int i = 0; i < 3; i++) { ok += xu.SensorWrite(slave, 0x3018 + i, v[i]) ? 1 : 0; transactions++; }
                 for (int i = 0; i < 3; i++) { ok += xu.SensorWrite(slave, 0x3020 + i, s[i]) ? 1 : 0; transactions++; }
             }
+            if (Gain.HasValue)
+            {
+                ok += xu.SensorWrite(slave, 0x3014, (byte)Gain.Value) ? 1 : 0;
+                ok += xu.SensorWrite(slave, 0x3009, Reg3009(Hcg)) ? 1 : 0;
+                transactions += 2;
+            }
             ok += xu.SensorWrite(slave, 0x3001, 0) ? 1 : 0; transactions++;
             return ok;
         }
 
-        public bool Equals(SensorTiming o) => Vmax == o.Vmax && Shs1 == o.Shs1;
+        public bool Equals(SensorTiming o) => Vmax == o.Vmax && Shs1 == o.Shs1 && Gain == o.Gain && Hcg == o.Hcg;
         public override bool Equals(object o) => o is SensorTiming t && Equals(t);
-        public override int GetHashCode() => Vmax * 31 + Shs1;
-        public override string ToString() => $"VMAX={Vmax} SHS1={Shs1}";
+        public override int GetHashCode() => (Vmax * 31 + Shs1) * 31 + (Gain ?? -1) * 2 + (Hcg ? 1 : 0);
+        public override string ToString() => $"VMAX={Vmax} SHS1={Shs1}" + (Gain.HasValue ? $" GAIN={Gain}{(Hcg ? " HCG" : "")}" : "");
     }
 }
