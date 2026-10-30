@@ -6,7 +6,7 @@
     <TargetFramework>net48</TargetFramework>
     <OutputType>WinExe</OutputType>
     <AssemblyName>SxFlash</AssemblyName>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <RootNamespace>Sonix290</RootNamespace>
     <EnableSourceLink>false</EnableSourceLink>

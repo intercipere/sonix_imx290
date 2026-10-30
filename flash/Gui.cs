@@ -23,6 +23,7 @@ sealed class MainForm : Form
     readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Fill, Maximum = 1000 };
     readonly Button btnCancel = new Button { Text = "Cancel", AutoSize = true, Enabled = false };
     readonly Label status = new Label { AutoSize = true, Text = "Ready." };
+    readonly Label slowPort = new Label { AutoSize = true, Dock = DockStyle.Top, Visible = false, BackColor = Color.Gold, ForeColor = Color.Black };
     readonly TextBox log = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, Font = new Font("Consolas", 9f), WordWrap = true };
 
     string backupPath;
@@ -32,6 +33,7 @@ sealed class MainForm : Form
     bool polling;
     bool busy;
     bool waiting, stopWait;  // after a write: waiting for the replug
+    bool checkingPort;       // the port check when the window opens
 
     public MainForm()
     {
@@ -43,14 +45,16 @@ sealed class MainForm : Form
 
         var warn = new Label
         {
-            Text = "Flashing changes the camera's firmware. A mistake can leave the camera unusable, and it can then only be recovered " +
-                   "with an external SPI programmer. Use this only on a camera you can afford to lose, on a USB port of the CPU (not " +
-                   "the chipset), with only this one Sonix camera connected and no other program using a camera (close PHD2, SharpCap, N.I.N.A., " +
-                   "video calls). Never unplug the camera or close this window while it writes. " +
-                   "No warranty.",
+            Text = "Flashing changes the camera's firmware. A mistake can leave the camera unusable (recoverable only with an external " +
+                   "SPI programmer). Use this only on a camera you can afford to lose, with only this one Sonix camera connected and no " +
+                   "other program using a camera. Never unplug the camera or close this window while it writes. No warranty.",
             ForeColor = Color.White, BackColor = Color.Firebrick, Padding = new Padding(8), AutoSize = true, MaximumSize = new Size(676, 0),
             Dock = DockStyle.Top,
         };
+
+        // shown only while the camera is on a slow port (checked when the window opens and by every command)
+        slowPort.Padding = new Padding(8);
+        slowPort.MaximumSize = new Size(676, 0);
 
         var gBackup = new GroupBox { Text = "Backup of the camera's flash (required)", AutoSize = true, Dock = DockStyle.Top, Padding = new Padding(8) };
         var fBackup = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true, MaximumSize = new Size(660, 0) };
@@ -84,6 +88,7 @@ sealed class MainForm : Form
         Controls.Add(bar);
         Controls.Add(gAct);
         Controls.Add(gBackup);
+        Controls.Add(slowPort);
         Controls.Add(warn);
         Padding = new Padding(12);
 
@@ -101,6 +106,17 @@ sealed class MainForm : Form
         Log.Enabled = true;
         Log.Open("sxflash");
         Program.NoteHook = AddLog;
+        Program.StatusHook = t => OnUi(() => { if (busy) status.Text = t; });
+        Program.PortHook = ms => OnUi(() => ShowPort(ms));
+        Shown += async (s, e) =>
+        {
+            if (await Task.Run(() => CountCameras()) != 1) return;
+            checkingPort = true;
+            UpdateButtons();
+            try { await Task.Run(() => Program.MeasurePort()); }
+            catch (Exception ex) { AddLog("port check failed: " + ex.Message); }
+            finally { checkingPort = false; UpdateButtons(); }
+        };
         // the bar moves with the flash reads; between them it runs as a marquee, so a long step does not look frozen
         Program.ProgressHook = (n, total) => OnUi(() =>
         {
@@ -142,6 +158,12 @@ sealed class MainForm : Form
 
     bool PatchMode => rbPatch.Checked;
 
+    void ShowPort(double readMs)
+    {
+        slowPort.Visible = Program.IsSlow(readMs);
+        if (slowPort.Visible) slowPort.Text = Program.SlowPortText(readMs);
+    }
+
     void ModeChanged()
     {
         chkUnknown.Visible = !PatchMode;
@@ -154,7 +176,7 @@ sealed class MainForm : Form
     {
         bool have = backup != null;
         bool usable = have && backupState != Patch.State.Unknown;   // any known state: the original is rebuilt from it
-        bool idle = !busy && !waiting;
+        bool idle = !busy && !waiting && !checkingPort;
         btnBackup.Enabled = btnOpen.Enabled = rbPatch.Enabled = rbRestore.Enabled = chkUnknown.Enabled = idle;
         btnWrite.Enabled = idle && usable;
         btnCancel.Enabled = busy || waiting;
@@ -243,10 +265,10 @@ sealed class MainForm : Form
             bool ok = false;
             Invoke((Action)(() =>
             {
-                ok = MessageBox.Show(this, $"All checks passed. Last chance: {what}?\r\n\r\nThe write takes about 2 minutes. " +
-                                           "Do not unplug the camera or close this window until it says it is done.",
+                ok = MessageBox.Show(this, $"All checks passed. Last chance: {what}?\r\n\r\nThe write takes {Program.WriteDuration}. " +
+                                           "Do not unplug the camera, close this window or put the PC to sleep until it says it is done.",
                                      Text, MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.OK;
-                if (ok) status.Text = "Writing (about 2 minutes). Do not unplug the camera or close this window.";
+                if (ok) status.Text = $"Writing ({Program.WriteDuration}). Do not unplug the camera or close this window.";
             }));
             return ok;
         };

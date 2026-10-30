@@ -36,8 +36,11 @@ to 15 s).
 - Windows 10 or 11 (.NET Framework 4.8, built into Windows).
 - A camera with a **known firmware**. The tool checks this itself: it compares the whole flash with a list of known
   firmware versions and refuses anything else. So far one version is known (two cameras tested, both identical).
-- A USB port on the **CPU's USB controller**. On desktop PCs these are usually the rear ports next to the video
-  outputs. Some chipset ports make the camera's register access ten times slower; the tool refuses those.
+- Preferably a USB port on the **CPU's USB controller**. On desktop PCs these are usually the rear ports next to the
+  video outputs. Some chipset ports make the camera's register access ten times slower: the tool works there too, but
+  says so, and everything takes about ten times as long (a write about 30 minutes instead of 3).
+- The PC must stay on during a write. The tool keeps Windows from going to sleep by itself while it works; do not
+  put it to sleep or shut it down yourself.
 - **Only this one Sonix camera connected**, and **no other program using any camera** (close PHD2, SharpCap,
   N.I.N.A., video calls). The tool checks both and refuses otherwise.
 
@@ -49,7 +52,7 @@ releases) and start it (no installation). The window title shows the tool and pa
 ### 1. Back up the flash
 
 Click **1. Back up the camera's flash...** and choose where to save the file. The tool reads the whole flash twice
-(about 75 seconds) and saves the file only if both reads match. **Keep this file**: it is your way back. A backup
+(about 75 seconds; on a slow port about 11 minutes) and saves the file only if both reads match. **Keep this file**: it is your way back. A backup
 is never overwritten.
 
 The tool then tells you what it found:
@@ -74,7 +77,7 @@ is written yet:
 When all checks pass, a window asks **"All checks passed. Last chance: patch the original firmware to v1?"**. Click
 OK to write, Cancel to stop (nothing is written then).
 
-The write takes about **2.5 minutes**: erase, write 16 pages and read each back, read the whole block back, then read
+The write takes about **2.5 minutes** (on a slow port about 21 minutes): erase, write 16 pages and read each back, read the whole block back, then read
 the whole flash back through the camera's own firmware and compare all 128 KB. The log shows each step. **Do not
 unplug the camera or close the window during this time**; the window refuses to close while it writes.
 
@@ -109,7 +112,7 @@ updates it in one write (*update the patch from v1 to v2*). If the camera alread
 
 | What you see | What it means and what to do |
 |---|---|
-| *REFUSED: slow USB port* | The camera is on a slow (chipset) USB port. Use a rear port on the CPU's controller. Nothing was written. |
+| *Slow USB port: ... takes about N minutes* | The camera is on a slow (chipset) USB port. It works, only slower; a rear port on the CPU's controller is faster. Keep the PC on until it is done. |
 | *REFUSED: N Sonix cameras connected* | Unplug every Sonix camera except the one to patch. |
 | *REFUSED ...: other programs are using a camera now: phd2.exe* | Close the program named there and try again. Nothing was written. |
 | *check stopped: lost the flash controller* | Another program probably started or stopped the camera during the checks. Nothing was written; the camera is unchanged. Close every camera program and try again. |
@@ -154,7 +157,8 @@ anything is written.
 
 - Two cameras with the same firmware (`0C45:6366`, `SONIX_IPC-292B----IMX291`), Windows 11, CPU USB port:
   backup, patch, restore (from the original and from a patched backup), "nothing to do", and the recovery restore;
-  every write verified (about 142 s each). With the ASCOM driver both patched cameras deliver verified exposures
+  every write verified (about 142 s each). On a slow AMD chipset port (20 ms per register access): backup, restore
+  and patch on one camera, both writes verified (about 31 minutes each). With the ASCOM driver both patched cameras deliver verified exposures
   from 0.1 s to 3 s in uncompressed 1080p.
 - Not tested: a camera that no longer starts after a failed write, other firmware versions, Windows 10.
 

@@ -47,6 +47,9 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
 
     [DllImport("kernel32.dll")]
     static extern bool AttachConsole(int pid);
+    [DllImport("kernel32.dll")]
+    static extern uint SetThreadExecutionState(uint flags);
+    const uint EsContinuous = 0x80000000, EsSystemRequired = 0x00000001;
 
     [STAThread]
     static int Main(string[] argv)
@@ -89,6 +92,9 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
     /// <summary>One command with Args/Opt already set (shared by the command line and the window).</summary>
     internal static int Execute(string cmd)
     {
+        // no idle sleep while a command runs (a write on a slow port takes ~30 min; sleep removes the camera);
+        // this thread waits for the whole command, and the request ends with it
+        SetThreadExecutionState(EsContinuous | EsSystemRequired);
         try
         {
             switch (cmd)
@@ -112,6 +118,10 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
             Note("FAILED: " + e);
             return 1;
         }
+        finally
+        {
+            SetThreadExecutionState(EsContinuous);
+        }
     }
 
     // hooks for the window: log lines, read progress, and cancelling a read (only before anything is written)
@@ -127,6 +137,33 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
     internal static Func<string, bool> ConfirmHook;
     /// <summary>Set when the erase is about to start: from here a failure may leave the sector changed.</summary>
     internal static volatile bool WriteStarted;
+    /// <summary>The window's status line (a slow port changes the expected durations).</summary>
+    internal static Action<string> StatusHook;
+    /// <summary>Expected duration of the write itself, for the window's last question and status line.</summary>
+    internal static string WriteDuration = "about 2 minutes";
+
+    // Slow USB ports (AMD chipset ports: ~20 ms per register read instead of ~2 ms) work, only slower. Measured
+    // 2026-10-30 at 20 ms per read (board 2, verified writes): backup 11 min, checks 4 min (+ 5.5 min without a
+    // backup from this session), write 21 min.
+    internal static bool IsSlow(double readMs) => readMs > 8;
+    static string Minutes(double minutesAt20Ms, double readMs) => $"about {Math.Max(1, Math.Round(minutesAt20Ms * readMs / 20))} minutes";
+
+    /// <summary>The window's notice for a slow port, with the expected durations.</summary>
+    internal static string SlowPortText(double readMs) =>
+        $"Slow USB port: everything takes about ten times as long here (backup {Minutes(11, readMs)}, patch or restore " +
+        $"{Minutes(25, readMs)}). It works, but a USB port on the CPU's controller is much faster (on desktop PCs usually " +
+        "a rear port next to the video outputs): plug the camera in there now if you can.";
+
+    /// <summary>The window: called with the measured register read time by every camera command.</summary>
+    internal static Action<double> PortHook;
+
+    /// <summary>The window's check at start: register read time of the one connected camera (stream never run).</summary>
+    internal static double MeasurePort()
+    {
+        double ms = 0;
+        WithDevice((d, x) => { ms = ReadMs(x); Note($"ASIC read {ms:F1} ms"); return 0; });
+        return ms;
+    }
 
     static void Note(string s)
     {
@@ -551,7 +588,7 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
                 Note($"WARNING: the erase never showed busy (finished before the first poll?); status {string.Join(" ", more.Select(v => v.ToString("X2")))}");
                 if (more.Any(v => v != 0x00)) throw new InvalidOperationException("status not 0x00 after an erase that never showed busy");
             }
-            Note("erase finished; reading the sector to check that it is blank (about 30 s)...");
+            Note($"erase finished; reading the sector to check that it is blank ({About(30, 4)})...");
             var blank = Read(addr, SectorLen);
             int notFF = blank.Count(b => b != 0xFF);
             Note($"erase: busy {(sawBusy ? $"for ~{ms} ms" : "never seen")}; blank check: {notFF} bytes not FF");
@@ -574,12 +611,19 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
 
     // ---------- camera commands ----------
 
+    static double portMs;   // the last ReadMs, for the expected durations of the steps
+
     static double ReadMs(SonixXu x)
     {
         var t = Stopwatch.StartNew();
         for (int i = 0; i < 6; i++) x.AsicRead(0x101F);
-        return t.Elapsed.TotalMilliseconds / 6;
+        portMs = t.Elapsed.TotalMilliseconds / 6;
+        PortHook?.Invoke(portMs);
+        return portMs;
     }
+
+    /// <summary>A step's expected duration: seconds on a CPU port, or minutes as measured on a slow port.</summary>
+    static string About(int cpuSeconds, double minutesAt20Ms) => IsSlow(portMs) ? Minutes(minutesAt20Ms, portMs) : $"about {cpuSeconds} s";
 
     static int Probe(UvcDevice d, SonixXu x)
     {
@@ -612,8 +656,15 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
     {
         string path = Args[1];
         if (File.Exists(path)) { Note($"REFUSED: {path} exists (a backup is never overwritten)"); return 2; }
-        Note($"ASIC read {ReadMs(x):F1} ms");
-        Note("reading the camera's flash, first pass (128 KB, ~45 s)");
+        double readMs = ReadMs(x);
+        Note($"ASIC read {readMs:F1} ms");
+        if (IsSlow(readMs))
+        {
+            string t = $"Slow USB port: the backup takes {Minutes(11, readMs)} (on a port of the CPU's controller about 75 seconds).";
+            Note($"WARNING: slow USB port ({readMs:F0} ms per register read, ~2 ms on a CPU port). {t}");
+            StatusHook?.Invoke(t);
+        }
+        Note("reading the camera's flash, first pass (128 KB)");
         var a = FirmwareRead(d, x, 0, ImageLen);
         Note("second pass");
         var b = FirmwareRead(d, x, 0, ImageLen);
@@ -646,7 +697,16 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
 
         double readMs = ReadMs(x);
         Note($"ASIC read {readMs:F1} ms");
-        if (readMs > 8) { Note("REFUSED: slow USB port (> 8 ms per register read); use a port on the CPU's controller"); return 1; }
+        WriteDuration = "about 2 minutes";
+        if (IsSlow(readMs))
+        {
+            // verified on a chipset port: the same checks and writes, only ~10x slower; idle sleep is held off in Execute
+            WriteDuration = Minutes(21, readMs);
+            string t = $"Slow USB port: the checks take {Minutes(KnownFlash != null ? 4 : 10, readMs)}, the write {WriteDuration} " +
+                       "(on a port of the CPU's controller about 3 minutes in all). Nothing is written yet.";
+            Note($"WARNING: slow USB port ({readMs:F0} ms per register read, ~2 ms on a CPU port). {t}");
+            StatusHook?.Invoke(t);
+        }
         if (!NoOtherCameraUsers("before the checks")) return 1;
 
         // the right board in the expected state: the whole low 128 KB as the firmware reads it
@@ -658,7 +718,7 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
         }
         else
         {
-            Note("reading the camera's flash (128 KB, ~45 s)");
+            Note($"reading the camera's flash (128 KB, {About(40, 5.5)})");
             cam = FirmwareRead(d, x, 0, ImageLen);
         }
         int outside = 0;
@@ -707,7 +767,7 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
                 Note($"status 0x{s:X2}");
                 if (s != 0x00) { Note("REFUSED: status register not 0x00 (busy, write enabled or protected)"); return 1; }
                 // raw read of the whole sector, holding the controller about as long as erase + blank check would
-                Note("reading the sector directly from the flash chip to compare it (about 30 s)...");
+                Note($"reading the sector directly from the flash chip to compare it ({About(30, 4)})...");
                 var raw = spi.Read(Sector, SectorLen);
                 int rawBad = Enumerable.Range(0, SectorLen).Count(i => raw[i] != cam[Sector + i]);
                 Note(rawBad == 0 ? $"raw SPI read of the sector equals the firmware read ({hold.Elapsed.TotalSeconds:F1} s holding the controller)"
@@ -752,7 +812,7 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
                     spi.PageProgram(a, image, a);
                     Note($"page 0x{a:X5} programmed and read back ({sw.Elapsed.TotalSeconds:F1} s)");
                 }
-                Note("all pages written; reading the whole sector back from the flash chip (about 30 s)...");
+                Note($"all pages written; reading the whole sector back from the flash chip ({About(30, 4)})...");
                 var raw = spi.Read(Sector, SectorLen);
                 int rawBad = Enumerable.Range(0, SectorLen).Count(i => raw[i] != image[Sector + i]);
                 if (rawBad > 0) throw new InvalidOperationException($"raw read of the whole sector: {rawBad} bytes differ from the image");
@@ -781,7 +841,7 @@ After a write: replug the camera. If a write fails: do NOT replug, keep it power
         }
 
         // independent of the raw path: the firmware's own reads, the whole 128 KB, controller released
-        Note("reading the whole flash back through the camera's firmware for the final check (about 40 s)...");
+        Note($"reading the whole flash back through the camera's firmware for the final check ({About(40, 5.5)})...");
         var back = FirmwareRead(d, x, 0, ImageLen);
         int inside = Enumerable.Range(Sector, SectorLen).Count(i => back[i] != image[i]);
         int outsideBad = Enumerable.Range(0, ImageLen).Count(i => back[i] != image[i]) - inside;
